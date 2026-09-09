@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
@@ -35,6 +35,17 @@ async def _start_source_flow(hass: HomeAssistant, entry) -> dict:
         (entry.entry_id, SUBENTRY_TYPE_SOURCE),
         context={"source": config_entries.SOURCE_USER},
     )
+
+
+def _fake_cloud(*, cloudhook_url: str | None = None) -> Mock:
+    """Return the small Home Assistant Cloud surface source setup needs."""
+    cloud = Mock()
+    cloud.CloudNotAvailable = RuntimeError
+    cloud.async_active_subscription.return_value = True
+    cloud.async_is_connected.return_value = True
+    cloud.async_get_or_create_cloudhook = AsyncMock(return_value=cloudhook_url)
+    cloud.async_delete_cloudhook = AsyncMock()
+    return cloud
 
 
 async def test_parent_flow_creates_single_parent_and_chains_source_flow(
@@ -152,6 +163,7 @@ async def test_nonlocal_source_prefers_nabu_casa_cloudhook(
     parent = entry_factory()
     hass.config_entries.async_remove_subentry(parent, "test-source-subentry")
     hass.config.components.add("cloud")
+    cloud = _fake_cloud(cloudhook_url="https://hooks.nabu.casa/example")
 
     with (
         patch(
@@ -159,18 +171,9 @@ async def test_nonlocal_source_prefers_nabu_casa_cloudhook(
             return_value="cloud-webhook-id",
         ),
         patch(
-            "custom_components.http_data_bridge.webhooks.cloud.async_active_subscription",
-            return_value=True,
+            "custom_components.http_data_bridge.webhooks._get_cloud_component",
+            return_value=cloud,
         ),
-        patch(
-            "custom_components.http_data_bridge.webhooks.cloud.async_is_connected",
-            return_value=True,
-        ),
-        patch(
-            "custom_components.http_data_bridge.webhooks.cloud.async_get_or_create_cloudhook",
-            new_callable=AsyncMock,
-            return_value="https://hooks.nabu.casa/example",
-        ) as create_cloudhook,
     ):
         result = await _start_source_flow(hass, parent)
         result = await hass.config_entries.subentries.async_configure(
@@ -195,7 +198,9 @@ async def test_nonlocal_source_prefers_nabu_casa_cloudhook(
         assert result["description_placeholders"]["webhook_url"] == (
             "https://hooks.nabu.casa/example"
         )
-        create_cloudhook.assert_awaited_once_with(hass, "cloud-webhook-id")
+        cloud.async_get_or_create_cloudhook.assert_awaited_once_with(
+            hass, "cloud-webhook-id"
+        )
 
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"], user_input={}
@@ -220,9 +225,8 @@ async def test_local_only_source_does_not_create_cloudhook(
             return_value="local-webhook-id",
         ),
         patch(
-            "custom_components.http_data_bridge.webhooks.cloud.async_get_or_create_cloudhook",
-            new_callable=AsyncMock,
-        ) as create_cloudhook,
+            "custom_components.http_data_bridge.webhooks._get_cloud_component"
+        ) as get_cloud,
         patch(
             "custom_components.http_data_bridge.webhooks.webhook.async_generate_url",
             return_value="http://192.168.1.2:8123/api/webhook/local-webhook-id",
@@ -248,7 +252,7 @@ async def test_local_only_source_does_not_create_cloudhook(
         )
 
     assert "192.168.1.2" in result["description_placeholders"]["webhook_url"]
-    create_cloudhook.assert_not_awaited()
+    get_cloud.assert_not_called()
 
 
 async def test_settings_only_reconfigure_preserves_ids_and_mappings(
