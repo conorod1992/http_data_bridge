@@ -6,53 +6,180 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
+from aiohttp.web import Request, Response
+
+from homeassistant.components import webhook
+from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_CLOUDHOOK_URL,
+    CONF_ENABLED,
     CONF_FIELDS,
+    CONF_LOCAL_ONLY,
+    CONF_SOURCE_ID,
     CONF_STALE_AFTER,
+    CONF_WEBHOOK_ID,
     DOMAIN,
     FIELD_PATH,
     STORAGE_SAVE_DELAY,
     STORAGE_VERSION,
+    SUBENTRY_TYPE_SOURCE,
 )
 from .helpers import JsonValue, get_by_pointer
+from .webhooks import (
+    async_delete_cloudhook,
+    async_handle_payload_request,
+    async_resolve_webhook_url,
+)
 
 UpdateListener = Callable[[], None]
 
 
-def _storage(hass: HomeAssistant, entry_id: str) -> Store[dict[str, Any]]:
-    """Create the storage helper for one config entry."""
-    return Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry_id}")
+def _storage(hass: HomeAssistant, source_id: str) -> Store[dict[str, Any]]:
+    """Create the storage helper for one stable source id."""
+    return Store(hass, STORAGE_VERSION, f"{DOMAIN}.{source_id}")
 
 
-async def async_remove_storage(hass: HomeAssistant, entry_id: str) -> None:
-    """Remove persisted data for a deleted config entry."""
-    await _storage(hass, entry_id).async_remove()
+async def async_remove_storage(hass: HomeAssistant, source_id: str) -> None:
+    """Remove persisted data for a deleted source."""
+    await _storage(hass, source_id).async_remove()
+
+
+class HttpDataBridgeManager:
+    """Own all push sources belonging to one parent config entry."""
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.sources: dict[str, HttpDataBridgeRuntime] = {}
+
+    async def async_setup(self) -> None:
+        """Load source state, resolve cloudhooks, and register webhooks."""
+        for subentry in tuple(self.entry.subentries.values()):
+            if subentry.subentry_type != SUBENTRY_TYPE_SOURCE:
+                continue
+
+            runtime = HttpDataBridgeRuntime(self.hass, self.entry, subentry)
+            await runtime.async_load()
+            self.sources[subentry.subentry_id] = runtime
+
+            if not runtime.enabled:
+                continue
+
+            source_data = dict(subentry.data)
+            _, cloudhook_url, created = await async_resolve_webhook_url(
+                self.hass, source_data
+            )
+            if cloudhook_url:
+                runtime.cloudhook_url = cloudhook_url
+                if created or source_data.get(CONF_CLOUDHOOK_URL) != cloudhook_url:
+                    source_data[CONF_CLOUDHOOK_URL] = cloudhook_url
+                    self.hass.config_entries.async_update_subentry(
+                        self.entry,
+                        subentry,
+                        data=source_data,
+                    )
+
+            webhook.async_register(
+                self.hass,
+                DOMAIN,
+                subentry.title,
+                runtime.webhook_id,
+                self._handler_for(runtime),
+                local_only=runtime.local_only,
+                allowed_methods={"POST"},
+            )
+            runtime.webhook_registered = True
+
+    def _handler_for(self, runtime: HttpDataBridgeRuntime):
+        """Build the Home Assistant webhook handler for one source."""
+
+        async def _handle_webhook(
+            _hass: HomeAssistant, _webhook_id: str, request: Request
+        ) -> Response:
+            return await async_handle_payload_request(runtime, request)
+
+        return _handle_webhook
+
+    async def async_shutdown(self) -> None:
+        """Unload all source runtimes and clean sources removed/restricted by update."""
+        current_by_source_id = {
+            str(subentry.data.get(CONF_SOURCE_ID, "")): subentry
+            for subentry in self.entry.subentries.values()
+            if subentry.subentry_type == SUBENTRY_TYPE_SOURCE
+        }
+
+        for runtime in self.sources.values():
+            if runtime.webhook_registered:
+                webhook.async_unregister(self.hass, runtime.webhook_id)
+                runtime.webhook_registered = False
+
+            await runtime.async_shutdown()
+
+            current = current_by_source_id.get(runtime.source_id)
+            if current is None:
+                if runtime.cloudhook_url or not runtime.local_only:
+                    await async_delete_cloudhook(self.hass, runtime.webhook_id)
+                await async_remove_storage(self.hass, runtime.source_id)
+                continue
+
+            # A reconfigure may switch a remotely reachable source to local-only.
+            # Ensure an old cloudhook is removed even if the config-flow cleanup
+            # could not reach Home Assistant Cloud at save time.
+            if bool(current.data.get(CONF_LOCAL_ONLY, False)) and runtime.cloudhook_url:
+                await async_delete_cloudhook(self.hass, runtime.webhook_id)
 
 
 class HttpDataBridgeRuntime:
     """Own one push source's selected values and availability state."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        subentry: ConfigSubentry,
+    ) -> None:
         """Initialize runtime data."""
         self.hass = hass
         self.entry = entry
+        self.subentry = subentry
+        self.source_id = str(subentry.data[CONF_SOURCE_ID])
         self.values: dict[str, JsonValue] = {}
         self.last_received: datetime | None = None
+        self.cloudhook_url = (
+            str(subentry.data[CONF_CLOUDHOOK_URL])
+            if subentry.data.get(CONF_CLOUDHOOK_URL)
+            else None
+        )
+        self.webhook_registered = False
 
         self._listeners: set[UpdateListener] = set()
         self._cancel_stale_timer: Callable[[], None] | None = None
-        self._store = _storage(hass, entry.entry_id)
+        self._store = _storage(hass, self.source_id)
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether this source should accept pushes."""
+        return bool(self.subentry.data.get(CONF_ENABLED, True))
+
+    @property
+    def webhook_id(self) -> str:
+        """Return the stable secret webhook id."""
+        return str(self.subentry.data[CONF_WEBHOOK_ID])
+
+    @property
+    def local_only(self) -> bool:
+        """Return whether the webhook only accepts local requests."""
+        return bool(self.subentry.data.get(CONF_LOCAL_ONLY, False))
 
     @property
     def stale_after(self) -> int:
         """Return stale timeout in seconds; zero disables expiry."""
-        value = self.entry.data.get(CONF_STALE_AFTER, 0)
+        value = self.subentry.data.get(CONF_STALE_AFTER, 0)
         try:
             return max(0, int(value))
         except (TypeError, ValueError):
@@ -61,7 +188,7 @@ class HttpDataBridgeRuntime:
     @property
     def available(self) -> bool:
         """Return whether the source currently has fresh data."""
-        if self.last_received is None:
+        if not self.enabled or self.last_received is None:
             return False
 
         stale_after = self.stale_after
@@ -78,7 +205,7 @@ class HttpDataBridgeRuntime:
             return
 
         configured_paths = {
-            str(field[FIELD_PATH]) for field in self.entry.data.get(CONF_FIELDS, [])
+            str(field[FIELD_PATH]) for field in self.subentry.data.get(CONF_FIELDS, [])
         }
 
         stored_values = stored.get("values")
@@ -95,8 +222,6 @@ class HttpDataBridgeRuntime:
             if parsed is not None:
                 self.last_received = dt_util.as_utc(parsed)
 
-        # Re-save the filtered view so fields removed by reconfiguration do not
-        # linger on disk indefinitely.
         if isinstance(stored_values, dict) and set(stored_values) != set(self.values):
             self._store.async_delay_save(self._storage_payload, STORAGE_SAVE_DELAY)
 
@@ -105,23 +230,19 @@ class HttpDataBridgeRuntime:
     async def async_accept_payload(self, payload: JsonValue) -> None:
         """Extract configured values from a new payload and persist only those."""
         new_values: dict[str, JsonValue] = {}
-        for field in self.entry.data.get(CONF_FIELDS, []):
+        for field in self.subentry.data.get(CONF_FIELDS, []):
             path = str(field[FIELD_PATH])
             try:
                 value = get_by_pointer(payload, path)
             except KeyError:
                 continue
             if isinstance(value, (dict, list)):
-                # A configured scalar changed shape. Treat it as missing instead of
-                # serializing arbitrary nested data into entity state/storage.
                 continue
             new_values[path] = value
 
         self.values = new_values
         self.last_received = dt_util.utcnow()
-
         self._store.async_delay_save(self._storage_payload, STORAGE_SAVE_DELAY)
-
         self._schedule_stale_timer()
         self._notify_listeners()
 
@@ -151,10 +272,6 @@ class HttpDataBridgeRuntime:
             self._cancel_stale_timer()
             self._cancel_stale_timer = None
 
-        # A delayed Store callback belongs to this runtime's Store instance and
-        # can otherwise fire after a config-entry reload. Flush the current
-        # selected view now so an old runtime cannot re-persist removed mappings
-        # after the replacement runtime has loaded.
         if self.last_received is not None or self.values:
             await self._store.async_save(self._storage_payload())
 

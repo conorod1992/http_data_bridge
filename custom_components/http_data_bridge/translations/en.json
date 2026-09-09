@@ -1,77 +1,92 @@
 {
   "title": "HTTP Data Bridge",
   "config": {
-    "step": {
-      "user": {
-        "title": "Create a push source",
-        "description": "Paste an example of the JSON your application will send. HTTP Data Bridge will inspect it and let you choose which values should become Home Assistant entities.",
-        "data": {
-          "source_name": "Source name",
-          "sample_payload": "Example JSON payload",
-          "stale_after": "Mark unavailable after",
-          "local_only": "Only allow local network requests"
-        },
-        "data_description": {
-          "source_name": "A friendly name for this external data source.",
-          "sample_payload": "This example is used only during setup. The full sample payload is not saved in the config entry.",
-          "stale_after": "Seconds without a valid payload before the selected entities become unavailable. Use 0 to keep the last values available indefinitely.",
-          "local_only": "Reject requests that do not come from the local network. Leave this off if an internet-hosted service needs to send data."
-        }
-      },
-      "reconfigure": {
-        "title": "Reconfigure push source",
-        "description": "Change source settings. Leave the example JSON blank to keep the existing entity mappings, or paste a new example to choose the fields again. The webhook ID is preserved.",
-        "data": {
-          "source_name": "Source name",
-          "sample_payload": "New example JSON payload",
-          "stale_after": "Mark unavailable after",
-          "local_only": "Only allow local network requests"
-        },
-        "data_description": {
-          "sample_payload": "Optional. Paste a new example only if you want to replace the current field mappings.",
-          "stale_after": "Seconds without a valid payload before the selected entities become unavailable. Use 0 to disable expiry.",
-          "local_only": "Reject requests that do not come from the local network."
-        }
-      },
-      "select_fields": {
-        "title": "Choose values",
-        "description": "Select the scalar JSON values that should become Home Assistant entities. Objects and arrays are shown through their individual leaf values.",
-        "data": {
-          "fields": "Values to expose"
-        }
-      },
-      "configure_field": {
-        "title": "Configure value {current} of {total}",
-        "description": "**JSON path:** `{field_path}`\n\n**Example value:** `{sample_value}`",
-        "data": {
-          "name": "Entity name",
-          "platform": "Entity type",
-          "unit": "Unit of measurement"
-        },
-        "data_description": {
-          "unit": "Optional. Available for numeric sensors. Boolean values can be exposed as binary sensors."
-        }
-      },
-      "confirm": {
-        "title": "Ready to receive data",
-        "description": "Keep the webhook URL secret: anyone who knows it can submit values to this source.\n\n**Webhook URL**\n\n`{webhook_url}`\n\n### cURL\n```bash\n{curl_example}\n```\n\n### JavaScript\n```javascript\n{javascript_example}\n```\n\n### PHP\n```php\n{php_example}\n```\n\nSave the integration, then send JSON to this URL with an HTTP POST request."
-      },
-      "confirm_existing": {
-        "title": "Ready to save changes",
-        "description": "The webhook URL is unchanged. Keep it secret: anyone who knows it can submit values to this source.\n\n**Webhook URL**\n\n`{webhook_url}`\n\nSave to apply these settings."
-      }
-    },
-    "error": {
-      "invalid_json": "Enter valid JSON.",
-      "payload_too_large": "The example payload is too large. The maximum size is 256 KiB.",
-      "no_scalar_fields": "The payload does not contain any scalar values that can become entities.",
-      "select_at_least_one": "Select at least one value.",
-      "binary_requires_boolean": "Only JSON true/false values can be configured as binary sensors.",
-      "empty_name": "Enter a name.",
-      "unit_requires_number": "A unit of measurement can only be used with a numeric example value."
-    },
     "abort": {
-      "reconfigure_successful": "HTTP Data Bridge was reconfigured successfully."
+      "single_instance_allowed": "HTTP Data Bridge is already configured. Add another source from the existing integration entry."
+    }
+  },
+  "config_subentries": {
+    "source": {
+      "entry_type": "Push source",
+      "initiate_flow": {
+        "user": "Add source"
+      },
+      "step": {
+        "user": {
+          "title": "Create a push source",
+          "description": "Paste an example of the JSON your application will send. HTTP Data Bridge will inspect it and let you choose which values should become Home Assistant entities.",
+          "data": {
+            "source_name": "Source name",
+            "sample_payload": "Example JSON payload",
+            "stale_after": "Mark unavailable after",
+            "local_only": "Only allow local network requests",
+            "enabled": "Enable source"
+          },
+          "data_description": {
+            "source_name": "A friendly name for this external data source.",
+            "sample_payload": "This example is used only during setup. The full sample payload is not saved in the config entry.",
+            "stale_after": "Seconds without a valid payload before the selected entities become unavailable. Use 0 to keep the last values available indefinitely.",
+            "local_only": "Reject requests that do not come from the local network. Leave this off if an internet-hosted service needs to send data. When Home Assistant Cloud is available, HTTP Data Bridge automatically uses a Nabu Casa cloudhook.",
+            "enabled": "Disable this source without deleting its mappings, entities, or webhook ID."
+          }
+        },
+        "reconfigure": {
+          "title": "Reconfigure push source",
+          "description": "Change source settings. Leave the example JSON blank to keep the existing entity mappings, or paste a new example to choose the fields again. The webhook ID is preserved.",
+          "data": {
+            "source_name": "Source name",
+            "sample_payload": "New example JSON payload",
+            "stale_after": "Mark unavailable after",
+            "local_only": "Only allow local network requests",
+            "enabled": "Enable source"
+          },
+          "data_description": {
+            "sample_payload": "Optional. Paste a new example only if you want to replace the current field mappings.",
+            "stale_after": "Seconds without a valid payload before the selected entities become unavailable. Use 0 to disable expiry.",
+            "local_only": "Reject requests that do not come from the local network. When disabled and Home Assistant Cloud is available, the shown webhook URL is a Nabu Casa cloudhook.",
+            "enabled": "Disable this source without deleting its mappings, entities, or webhook ID."
+          }
+        },
+        "select_fields": {
+          "title": "Choose values",
+          "description": "Select the scalar JSON values that should become Home Assistant entities. Objects and arrays are shown through their individual leaf values.",
+          "data": {
+            "fields": "Values to expose"
+          }
+        },
+        "configure_field": {
+          "title": "Configure value {current} of {total}",
+          "description": "**JSON path:** `{field_path}`\n\n**Example value:** `{sample_value}`",
+          "data": {
+            "name": "Entity name",
+            "platform": "Entity type",
+            "unit": "Unit of measurement"
+          },
+          "data_description": {
+            "unit": "Optional. Available for numeric sensors. Boolean values can be exposed as binary sensors."
+          }
+        },
+        "confirm": {
+          "title": "Ready to receive data",
+          "description": "Keep the webhook URL secret: anyone who knows it can submit values to this source.\n\n**Webhook URL**\n\n`{webhook_url}`\n\n### cURL\n```bash\n{curl_example}\n```\n\n### JavaScript\n```javascript\n{javascript_example}\n```\n\n### PHP\n```php\n{php_example}\n```\n\nSave the source, then send JSON to this URL with an HTTP POST request."
+        },
+        "confirm_existing": {
+          "title": "Ready to save changes",
+          "description": "The webhook ID is unchanged. Keep the URL secret: anyone who knows it can submit values to this source.\n\n**Webhook URL**\n\n`{webhook_url}`\n\nSave to apply these settings."
+        }
+      },
+      "error": {
+        "invalid_json": "Enter valid JSON.",
+        "payload_too_large": "The example payload is too large. The maximum size is 256 KiB.",
+        "no_scalar_fields": "The payload does not contain any scalar values that can become entities.",
+        "select_at_least_one": "Select at least one value.",
+        "binary_requires_boolean": "Only JSON true/false values can be configured as binary sensors.",
+        "empty_name": "Enter a name.",
+        "unit_requires_number": "A unit of measurement can only be used with a numeric example value."
+      },
+      "abort": {
+        "reconfigure_successful": "HTTP Data Bridge source was reconfigured successfully."
+      }
     }
   }
 }
