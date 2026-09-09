@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+import logging
 from typing import Any
 
 from aiohttp.web import Request, Response
@@ -37,6 +38,8 @@ from .webhooks import (
     async_resolve_webhook_url,
 )
 
+_LOGGER = logging.getLogger(__name__)
+
 UpdateListener = Callable[[], None]
 
 
@@ -59,42 +62,52 @@ class HttpDataBridgeManager:
         self.sources: dict[str, HttpDataBridgeRuntime] = {}
 
     async def async_setup(self) -> None:
-        """Load source state, resolve cloudhooks, and register webhooks."""
-        for subentry in tuple(self.entry.subentries.values()):
-            if subentry.subentry_type != SUBENTRY_TYPE_SOURCE:
-                continue
+        """Load source state, resolve cloudhooks, and register webhooks transactionally."""
+        try:
+            for subentry in tuple(self.entry.subentries.values()):
+                if subentry.subentry_type != SUBENTRY_TYPE_SOURCE:
+                    continue
 
-            runtime = HttpDataBridgeRuntime(self.hass, self.entry, subentry)
-            await runtime.async_load()
-            self.sources[subentry.subentry_id] = runtime
+                runtime = HttpDataBridgeRuntime(self.hass, self.entry, subentry)
+                await runtime.async_load()
+                self.sources[subentry.subentry_id] = runtime
 
-            if not runtime.enabled:
-                continue
+                if not runtime.enabled:
+                    continue
 
-            source_data = dict(subentry.data)
-            _, cloudhook_url, created = await async_resolve_webhook_url(
-                self.hass, source_data
-            )
-            if cloudhook_url:
-                runtime.cloudhook_url = cloudhook_url
-                if created or source_data.get(CONF_CLOUDHOOK_URL) != cloudhook_url:
-                    source_data[CONF_CLOUDHOOK_URL] = cloudhook_url
-                    self.hass.config_entries.async_update_subentry(
-                        self.entry,
-                        subentry,
-                        data=source_data,
-                    )
+                source_data = dict(subentry.data)
+                _, cloudhook_url, created = await async_resolve_webhook_url(
+                    self.hass, source_data
+                )
+                if cloudhook_url:
+                    runtime.cloudhook_url = cloudhook_url
+                    if created or source_data.get(CONF_CLOUDHOOK_URL) != cloudhook_url:
+                        source_data[CONF_CLOUDHOOK_URL] = cloudhook_url
+                        self.hass.config_entries.async_update_subentry(
+                            self.entry,
+                            subentry,
+                            data=source_data,
+                        )
 
-            webhook.async_register(
-                self.hass,
-                DOMAIN,
-                subentry.title,
-                runtime.webhook_id,
-                self._handler_for(runtime),
-                local_only=runtime.local_only,
-                allowed_methods={"POST"},
-            )
-            runtime.webhook_registered = True
+                webhook.async_register(
+                    self.hass,
+                    DOMAIN,
+                    subentry.title,
+                    runtime.webhook_id,
+                    self._handler_for(runtime),
+                    local_only=runtime.local_only,
+                    allowed_methods={"POST"},
+                )
+                runtime.webhook_registered = True
+        except Exception:
+            # A later source must not leave earlier webhooks/listeners/storage
+            # runtimes active when the parent entry fails setup. Otherwise a
+            # retry can immediately fail on duplicate webhook registration.
+            try:
+                await self.async_shutdown()
+            except Exception:  # pragma: no cover - defensive cleanup logging
+                _LOGGER.exception("Error rolling back partial HTTP Data Bridge setup")
+            raise
 
     def _handler_for(self, runtime: HttpDataBridgeRuntime):
         """Build the Home Assistant webhook handler for one source."""
