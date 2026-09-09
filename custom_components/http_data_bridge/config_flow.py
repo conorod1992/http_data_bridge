@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from http import HTTPStatus
 import json
 from typing import Any, override
 from uuid import uuid4
@@ -21,6 +20,7 @@ from homeassistant.config_entries import (
     SubentryFlowContext,
     SubentryFlowResult,
 )
+from homeassistant.const import MAX_LENGTH_STATE_STATE
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er, selector
 
@@ -40,6 +40,7 @@ from .const import (
     FIELD_NAME,
     FIELD_PATH,
     FIELD_PLATFORM,
+    FIELD_STORE_IN_ATTRIBUTE,
     FIELD_UNIT,
     MAX_PAYLOAD_BYTES,
     PARENT_TITLE,
@@ -52,7 +53,7 @@ from .const import (
 )
 from .helpers import (
     JsonValue,
-    iter_scalar_fields,
+    iter_json_nodes,
     parse_json,
     pointer_to_label,
     sample_display,
@@ -119,12 +120,43 @@ def _parse_sample(raw: str) -> JsonValue:
     return parse_json(raw)
 
 
-def _scalar_fields(sample: JsonValue) -> dict[str, JsonValue]:
-    """Return selectable scalar leaves, rejecting container-only samples."""
-    fields = dict(iter_scalar_fields(sample))
-    if not fields:
-        raise ValueError("no scalar fields")
-    return fields
+def _selectable_fields(sample: JsonValue) -> dict[str, JsonValue]:
+    """Return every selectable JSON node, including root and containers."""
+    return dict(iter_json_nodes(sample))
+
+
+def _requires_attribute_storage(value: JsonValue) -> bool:
+    """Return whether the sample cannot be represented safely as sensor state."""
+    if isinstance(value, (dict, list)):
+        return True
+    if isinstance(value, bool) or value is None:
+        return False
+    return len(str(value)) > MAX_LENGTH_STATE_STATE
+
+
+def _storage_guidance(value: JsonValue) -> str:
+    """Build novice-facing guidance for the sensor storage step."""
+    if isinstance(value, dict):
+        return (
+            "This example is a JSON object, so attribute storage is required. "
+            "The sensor state will be the time the object was received."
+        )
+    if isinstance(value, list):
+        return (
+            "This example is a JSON array, so attribute storage is required. "
+            "The sensor state will be the time the array was received."
+        )
+    rendered_length = 0 if value is None else len(str(value))
+    if rendered_length > MAX_LENGTH_STATE_STATE:
+        return (
+            f"This example is {rendered_length} characters long. Home Assistant "
+            f"sensor states are limited to {MAX_LENGTH_STATE_STATE} characters, "
+            "so attribute storage is required."
+        )
+    return (
+        "Leave attribute storage off for a normal sensor state. Enable it when you "
+        "want the complete value kept in the sensor's value attribute instead."
+    )
 
 
 class HttpDataBridgeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -182,6 +214,7 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
         self._selected_paths: list[str] = []
         self._field_configs: list[dict[str, Any]] = []
         self._field_index = 0
+        self._pending_field: dict[str, Any] | None = None
         self._reconfiguring = False
         self._created_cloudhook = False
         self._committed = False
@@ -324,13 +357,8 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
             except (json.JSONDecodeError, ValueError, UnicodeDecodeError, RecursionError):
                 errors[CONF_SAMPLE_PAYLOAD] = "invalid_json"
             else:
-                try:
-                    sample_fields = _scalar_fields(sample)
-                except ValueError:
-                    errors[CONF_SAMPLE_PAYLOAD] = "no_scalar_fields"
-                else:
-                    self._set_sample(sample, sample_fields)
-                    return await self.async_step_select_fields()
+                self._set_sample(sample, _selectable_fields(sample))
+                return await self.async_step_select_fields()
 
         return self.async_show_form(
             step_id="sample",
@@ -370,7 +398,7 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
     async def async_step_select_fields(
         self, user_input: dict[str, Any] | None = None
     ) -> SubentryFlowResult:
-        """Choose which scalar values should become Home Assistant entities."""
+        """Choose JSON values that should become Home Assistant entities."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -381,6 +409,7 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
                 self._selected_paths = selected
                 self._field_configs = []
                 self._field_index = 0
+                self._pending_field = None
                 return await self.async_step_configure_field()
 
         options = [
@@ -410,11 +439,10 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
     async def async_step_configure_field(
         self, user_input: dict[str, Any] | None = None
     ) -> SubentryFlowResult:
-        """Configure one selected field at a time."""
+        """Configure name and entity type for one selected JSON value."""
         path = self._selected_paths[self._field_index]
         sample = self._sample_fields[path]
         is_boolean = isinstance(sample, bool)
-        is_number = isinstance(sample, (int, float)) and not is_boolean
         default_platform = PLATFORM_BINARY_SENSOR if is_boolean else PLATFORM_SENSOR
         errors: dict[str, str] = {}
 
@@ -426,9 +454,6 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
                 errors[FIELD_NAME] = "empty_name"
             if platform == PLATFORM_BINARY_SENSOR and not is_boolean:
                 errors[FIELD_PLATFORM] = "binary_requires_boolean"
-            unit = str(user_input.get(FIELD_UNIT, "")).strip()
-            if unit and not is_number:
-                errors[FIELD_UNIT] = "unit_requires_number"
 
             if not errors:
                 field: dict[str, Any] = {
@@ -436,14 +461,12 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
                     FIELD_NAME: entity_name,
                     FIELD_PLATFORM: platform,
                 }
-                if platform == PLATFORM_SENSOR and unit:
-                    field[FIELD_UNIT] = unit
-                self._field_configs.append(field)
-                self._field_index += 1
+                if platform == PLATFORM_SENSOR:
+                    self._pending_field = field
+                    return await self.async_step_configure_sensor()
 
-                if self._field_index < len(self._selected_paths):
-                    return await self.async_step_configure_field()
-                return await self.async_step_confirm()
+                self._field_configs.append(field)
+                return await self._advance_field()
 
         platform_options = [
             selector.SelectOptionDict(value=PLATFORM_SENSOR, label="Sensor")
@@ -477,13 +500,13 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
                 selector.SelectSelectorConfig(options=platform_options)
             ),
         }
-        if is_number:
-            schema[
-                vol.Optional(
-                    FIELD_UNIT,
-                    default=user_input.get(FIELD_UNIT, "") if user_input else "",
-                )
-            ] = _TEXT_SELECTOR
+
+        type_guidance = (
+            "Binary sensor is recommended for JSON true/false and represents an "
+            "on/off state. Sensor stores the value as ordinary sensor data."
+            if is_boolean
+            else "This JSON value can be exposed as a Home Assistant sensor."
+        )
 
         return self.async_show_form(
             step_id="configure_field",
@@ -493,9 +516,76 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
                 "sample_value": sample_display(sample),
                 "current": str(self._field_index + 1),
                 "total": str(len(self._selected_paths)),
+                "type_guidance": type_guidance,
             },
             errors=errors,
         )
+
+    async def async_step_configure_sensor(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Configure normal-state versus attribute storage for a sensor."""
+        assert self._pending_field is not None
+        path = str(self._pending_field[FIELD_PATH])
+        sample = self._sample_fields[path]
+        is_number = isinstance(sample, (int, float)) and not isinstance(sample, bool)
+        requires_attribute = _requires_attribute_storage(sample)
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            store_in_attribute = bool(user_input[FIELD_STORE_IN_ATTRIBUTE])
+            unit = str(user_input.get(FIELD_UNIT, "")).strip()
+
+            if requires_attribute and not store_in_attribute:
+                errors[FIELD_STORE_IN_ATTRIBUTE] = "attribute_required"
+            if store_in_attribute and unit:
+                errors[FIELD_UNIT] = "attribute_cannot_have_unit"
+
+            if not errors:
+                field = dict(self._pending_field)
+                if store_in_attribute:
+                    field[FIELD_STORE_IN_ATTRIBUTE] = True
+                elif unit:
+                    field[FIELD_UNIT] = unit
+                self._field_configs.append(field)
+                self._pending_field = None
+                return await self._advance_field()
+
+        schema: dict[vol.Marker, Any] = {
+            vol.Required(
+                FIELD_STORE_IN_ATTRIBUTE,
+                default=(
+                    bool(user_input[FIELD_STORE_IN_ATTRIBUTE])
+                    if user_input is not None
+                    else requires_attribute
+                ),
+            ): selector.BooleanSelector(),
+        }
+        if is_number:
+            schema[
+                vol.Optional(
+                    FIELD_UNIT,
+                    default=user_input.get(FIELD_UNIT, "") if user_input else "",
+                )
+            ] = _TEXT_SELECTOR
+
+        return self.async_show_form(
+            step_id="configure_sensor",
+            data_schema=vol.Schema(schema),
+            description_placeholders={
+                "field_path": pointer_to_label(path),
+                "storage_guidance": _storage_guidance(sample),
+                "state_limit": str(MAX_LENGTH_STATE_STATE),
+            },
+            errors=errors,
+        )
+
+    async def _advance_field(self) -> SubentryFlowResult:
+        """Advance to the next selected value or final confirmation."""
+        self._field_index += 1
+        if self._field_index < len(self._selected_paths):
+            return await self.async_step_configure_field()
+        return await self.async_step_confirm()
 
     async def async_step_confirm(
         self, user_input: dict[str, Any] | None = None
@@ -590,13 +680,7 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
         except PayloadValidationError as err:
             return payload_error_response(err)
 
-        sample_fields = dict(iter_scalar_fields(sample))
-        if not sample_fields:
-            return json_response(
-                {"ok": False, "error": "no_scalar_fields"},
-                status=HTTPStatus.UNPROCESSABLE_ENTITY,
-            )
-
+        sample_fields = _selectable_fields(sample)
         self._set_sample(sample, sample_fields)
         return json_response(
             {"ok": True, "captured": True, "fields": len(sample_fields)}
