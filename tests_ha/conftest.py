@@ -38,13 +38,16 @@ def auto_enable_custom_integrations(enable_custom_integrations) -> None:
 @pytest.fixture(autouse=True)
 async def cleanup_loaded_entries(
     hass: HomeAssistant,
+    verify_cleanup,
 ) -> AsyncGenerator[None]:
-    """Unload HTTP Data Bridge entries so tests also exercise clean teardown."""
+    """Unload HTTP Data Bridge entries before HA verifies test cleanup."""
     yield
 
     # Reconfiguration schedules an entry reload asynchronously. Let that reload
     # settle before inspecting entry state, otherwise teardown can race the new
-    # entity platforms and leave their polling timer behind.
+    # entity platforms and leave their polling timer behind. Depending on
+    # verify_cleanup makes this fixture tear down first, so HA checks resources
+    # only after our normal integration unload has completed.
     await hass.async_block_till_done()
 
     for entry in hass.config_entries.async_entries(DOMAIN):
