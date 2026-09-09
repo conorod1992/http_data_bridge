@@ -22,6 +22,7 @@ from .const import (
     FIELD_NAME,
     FIELD_PATH,
     FIELD_PLATFORM,
+    FIELD_STORE_IN_ATTRIBUTE,
     FIELD_UNIT,
     PANEL_STATIC_URL,
     PANEL_URL_PATH,
@@ -43,6 +44,7 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
 
     if not domain_data.get(_BACKEND_REGISTERED):
         websocket_api.async_register_command(hass, websocket_sources)
+        websocket_api.async_register_command(hass, websocket_attribute_value)
 
         frontend_dir = Path(__file__).parent / "frontend"
         await hass.http.async_register_static_paths(
@@ -102,6 +104,14 @@ def async_remove_frontend_panel(hass: HomeAssistant) -> None:
     domain_data[_PANEL_REGISTERED] = False
 
 
+def _parent_entry(hass: HomeAssistant) -> ConfigEntry | None:
+    """Return the single configured parent entry defensively."""
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        return None
+    return next((item for item in entries if item.version >= 2), entries[0])
+
+
 async def _source_snapshot(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -138,6 +148,8 @@ async def _source_snapshot(
     for field in subentry.data.get(CONF_FIELDS, []):
         path = str(field[FIELD_PATH])
         value_present = runtime is not None and path in runtime.values
+        attribute_backed = bool(field.get(FIELD_STORE_IN_ATTRIBUTE, False))
+        field_available = bool(runtime and runtime.available and value_present)
         fields.append(
             {
                 "name": str(field[FIELD_NAME]),
@@ -145,8 +157,16 @@ async def _source_snapshot(
                 "path_label": pointer_to_label(path),
                 "platform": str(field[FIELD_PLATFORM]),
                 "unit": str(field.get(FIELD_UNIT, "")),
-                "available": bool(runtime and runtime.available and value_present),
-                "value": runtime.values[path] if value_present and runtime else None,
+                "attribute_backed": attribute_backed,
+                "available": field_available,
+                # Attribute-backed values can approach the full 256 KiB webhook
+                # limit. Keep routine panel refreshes lightweight and fetch them
+                # only when an admin explicitly asks to view one.
+                "value": (
+                    runtime.values[path]
+                    if field_available and runtime and not attribute_backed
+                    else None
+                ),
             }
         )
 
@@ -180,14 +200,11 @@ async def websocket_sources(
     msg: dict[str, Any],
 ) -> None:
     """Return configured sources and selected values for the admin panel."""
-    entries = hass.config_entries.async_entries(DOMAIN)
-    if not entries:
+    entry = _parent_entry(hass)
+    if entry is None:
         connection.send_result(msg["id"], {"entry_id": None, "sources": []})
         return
 
-    # The integration enforces one parent entry. Keep the API defensive in case
-    # old/incomplete migration data temporarily leaves more than one entry.
-    entry = next((item for item in entries if item.version >= 2), entries[0])
     sources = [
         await _source_snapshot(hass, entry, subentry)
         for subentry in entry.subentries.values()
@@ -200,4 +217,64 @@ async def websocket_sources(
             "entry_id": entry.entry_id,
             "sources": sources,
         },
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/attribute_value",
+        vol.Required("source_id"): str,
+        vol.Required("path"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_attribute_value(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return one selected attribute-backed value only on explicit admin request."""
+    entry = _parent_entry(hass)
+    if entry is None:
+        connection.send_error(msg["id"], "not_found", "HTTP Data Bridge is not configured")
+        return
+
+    source_id = str(msg["source_id"])
+    path = str(msg["path"])
+    subentry = next(
+        (
+            item
+            for item in entry.subentries.values()
+            if item.subentry_type == SUBENTRY_TYPE_SOURCE
+            and str(item.data.get(CONF_SOURCE_ID, "")) == source_id
+        ),
+        None,
+    )
+    if subentry is None:
+        connection.send_error(msg["id"], "not_found", "Push source not found")
+        return
+
+    mapping_exists = any(
+        str(field.get(FIELD_PATH, "")) == path
+        and bool(field.get(FIELD_STORE_IN_ATTRIBUTE, False))
+        for field in subentry.data.get(CONF_FIELDS, [])
+    )
+    if not mapping_exists:
+        connection.send_error(msg["id"], "not_found", "Attribute-backed mapping not found")
+        return
+
+    manager = getattr(entry, "runtime_data", None)
+    runtime = (
+        manager.sources.get(subentry.subentry_id)
+        if isinstance(manager, HttpDataBridgeManager)
+        else None
+    )
+    if runtime is None or not runtime.available or path not in runtime.values:
+        connection.send_result(msg["id"], {"available": False, "value": None})
+        return
+
+    connection.send_result(
+        msg["id"],
+        {"available": True, "value": runtime.values[path]},
     )
