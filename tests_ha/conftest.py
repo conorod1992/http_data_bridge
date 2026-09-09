@@ -35,6 +35,17 @@ def auto_enable_custom_integrations(enable_custom_integrations) -> None:
     """Allow Home Assistant to discover this repository's custom integration."""
 
 
+@pytest.fixture(autouse=True)
+async def cleanup_loaded_entries(hass: HomeAssistant):
+    """Unload HTTP Data Bridge entries so tests also exercise clean teardown."""
+    yield
+
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.state is config_entries.ConfigEntryState.LOADED:
+            await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
 @pytest.fixture
 def entry_factory(hass: HomeAssistant) -> Callable[..., MockConfigEntry]:
     """Create a parent entry containing one HTTP Data Bridge source subentry."""
