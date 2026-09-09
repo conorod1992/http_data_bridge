@@ -30,6 +30,10 @@ from .const import (
     SUBENTRY_TYPE_SOURCE,
 )
 from .data import HttpDataBridgeManager, HttpDataBridgeRuntime
+from .frontend_management import (
+    async_cleanup_management_drafts,
+    async_register_management_commands,
+)
 from .helpers import mapping_value_is_available, pointer_to_label
 from .webhooks import async_resolve_webhook_url
 
@@ -45,6 +49,7 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
     if not domain_data.get(_BACKEND_REGISTERED):
         websocket_api.async_register_command(hass, websocket_sources)
         websocket_api.async_register_command(hass, websocket_attribute_value)
+        async_register_management_commands(hass)
 
         frontend_dir = Path(__file__).parent / "frontend"
         await hass.http.async_register_static_paths(
@@ -91,6 +96,12 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
 def async_remove_frontend_panel(hass: HomeAssistant) -> None:
     """Remove the sidebar panel when the single parent entry is deleted."""
     domain_data = hass.data.get(DOMAIN)
+    if domain_data:
+        hass.async_create_task(
+            async_cleanup_management_drafts(hass),
+            "clean HTTP Data Bridge frontend management drafts",
+        )
+
     if (
         not domain_data
         or not domain_data.get(_PANEL_REGISTERED)
@@ -194,9 +205,7 @@ async def _source_snapshot(
     }
 
 
-@websocket_api.websocket_command(
-    {vol.Required("type"): f"{DOMAIN}/sources"}
-)
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/sources"})
 @websocket_api.require_admin
 @websocket_api.async_response
 async def websocket_sources(
@@ -242,7 +251,9 @@ async def websocket_attribute_value(
     """Return one selected attribute-backed value only on explicit admin request."""
     entry = _parent_entry(hass)
     if entry is None:
-        connection.send_error(msg["id"], "not_found", "HTTP Data Bridge is not configured")
+        connection.send_error(
+            msg["id"], "not_found", "HTTP Data Bridge is not configured"
+        )
         return
 
     source_id = str(msg["source_id"])
@@ -270,7 +281,9 @@ async def websocket_attribute_value(
         None,
     )
     if mapping is None:
-        connection.send_error(msg["id"], "not_found", "Attribute-backed mapping not found")
+        connection.send_error(
+            msg["id"], "not_found", "Attribute-backed mapping not found"
+        )
         return
 
     manager = getattr(entry, "runtime_data", None)

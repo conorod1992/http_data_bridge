@@ -1,403 +1,70 @@
 class HttpDataBridgePanel extends HTMLElement {
   constructor() {
-    super();
-    this.attachShadow({ mode: "open" });
-    this._hass = null;
-    this._data = null;
-    this._loading = false;
-    this._loaded = false;
-    this._error = null;
-    this._revealed = new Set();
-    this._copyMessage = "";
-    this._pollTimer = null;
-    this._viewing = null;
-    this._viewLoading = false;
-    this._viewError = null;
-    this.shadowRoot.addEventListener("click", (event) => this._handleClick(event));
+    super(); this.attachShadow({mode:"open"});
+    this._hass=null; this._data=null; this._busy=false; this._error=""; this._editor=null;
+    this._delete=null; this._view=null; this._revealed=new Set(); this._timer=null; this._captureTimer=null;
+    this.shadowRoot.addEventListener("click",e=>void this._click(e));
+    this.shadowRoot.addEventListener("input",e=>this._input(e));
+    this.shadowRoot.addEventListener("change",e=>this._change(e));
   }
-
-  set hass(hass) {
-    this._hass = hass;
-    if (!this._loaded && !this._loading) {
-      void this._load();
-    }
+  set hass(v){this._hass=v;if(!this._data&&!this._busy)void this._load();}
+  set panel(v){this._panel=v;}
+  connectedCallback(){this._render();this._timer??=setInterval(()=>{if(document.visibilityState==="visible"&&!this._editor)void this._load(true);},15000);}
+  disconnectedCallback(){clearInterval(this._timer);this._timer=null;this._stopCapture();if(this._editor?.draftId)void this._cancelDraft(this._editor.draftId);}
+  async _ws(type,data={}){return this._hass.connection.sendMessagePromise({type:`http_data_bridge/${type}`,...data});}
+  _err(e){return e instanceof Error?e.message:String(e?.message??e);}
+  async _load(silent=false){if(!this._hass||this._busy)return;this._busy=true;if(!silent)this._render();try{this._data=await this._ws("sources");this._error="";}catch(e){this._error=this._err(e);}finally{this._busy=false;this._render();}}
+  _source(id){return this._data?.sources?.find(x=>x.source_id===id);}
+  _newEditor(source=null){const existing=(source?.fields||[]).map(f=>({path:f.path,name:f.name,platform:f.platform,store_in_attribute:!!f.attribute_backed,unit:f.unit||""}));return{mode:source?"edit":"add",sourceId:source?.source_id||null,step:"settings",name:source?.name||"Push source",enabled:source?.enabled??true,localOnly:source?.local_only??false,staleAfter:source?.stale_after??0,method:source?"keep":"live",sample:'{\n  "temperature": 21.4,\n  "online": true\n}',draftId:null,captureUrl:null,nodes:[],existing,mappings:new Map(existing.map(f=>[f.path,{...f}]))};}
+  _input(e){if(!this._editor)return;const t=e.target;if(!(t instanceof HTMLInputElement||t instanceof HTMLTextAreaElement))return;const k=t.dataset.key;if(k==="name")this._editor.name=t.value;if(k==="stale")this._editor.staleAfter=t.value;if(k==="sample")this._editor.sample=t.value;const p=t.dataset.path,f=t.dataset.field;if(p!==undefined&&f){const m=this._editor.mappings.get(p);if(m)m[f]=t.value;}}
+  _change(e){if(!this._editor)return;const t=e.target;if(!(t instanceof HTMLInputElement||t instanceof HTMLSelectElement))return;const k=t.dataset.key;if(k==="enabled")this._editor.enabled=t.checked;if(k==="local")this._editor.localOnly=t.checked;if(k==="method")this._editor.method=t.value;const p=t.dataset.path,f=t.dataset.field;if(p===undefined||!f)return;const n=this._editor.nodes.find(x=>x.path===p);if(f==="selected"){if(t.checked&&!this._editor.mappings.has(p))this._editor.mappings.set(p,this._defaultMap(n));if(!t.checked)this._editor.mappings.delete(p);this._render();return;}const m=this._editor.mappings.get(p);if(!m)return;if(f==="platform"){m.platform=t.value;if(m.platform==="binary_sensor"){m.store_in_attribute=false;m.unit="";}this._render();}if(f==="store"){m.store_in_attribute=t.checked;if(m.store_in_attribute)m.unit="";this._render();}}
+  _defaultMap(n){const old=this._editor.existing.find(x=>x.path===n.path);if(old)return{...old,platform:old.platform==="binary_sensor"&&!n.is_boolean?"sensor":old.platform,store_in_attribute:n.requires_attribute||old.store_in_attribute,unit:n.requires_attribute||old.store_in_attribute?"":old.unit};return{path:n.path,name:n.suggested_name,platform:n.is_boolean?"binary_sensor":"sensor",store_in_attribute:!!n.requires_attribute,unit:""};}
+  async _click(e){const b=e.target instanceof Element?e.target.closest("button"):null;if(!b)return;const a=b.dataset.action,id=b.dataset.id;
+    if(a==="refresh")return void await this._load();
+    if(a==="settings"){history.pushState(null,"","/config/integrations/integration/http_data_bridge");dispatchEvent(new Event("location-changed"));return;}
+    if(a==="add"){this._editor=this._newEditor();this._error="";this._render();return;}
+    if(a==="edit"){this._editor=this._newEditor(this._source(id));this._error="";this._render();return;}
+    if(a==="delete"){this._delete=this._source(id);this._render();return;}
+    if(a==="delete-cancel"){this._delete=null;this._render();return;}
+    if(a==="delete-go")return void await this._deleteSource();
+    if(a==="reveal"){this._revealed.has(id)?this._revealed.delete(id):this._revealed.add(id);this._render();return;}
+    if(a==="copy")return void await this._copy(this._source(id)?.webhook_url||"");
+    if(a==="view")return void await this._viewValue(this._source(id),b.dataset.path??"");
+    if(a==="view-close"){this._view=null;this._render();return;}
+    if(a==="editor-cancel")return void await this._closeEditor();
+    if(a==="back")return void await this._back();
+    if(a==="next")return void await this._next();
+    if(a==="analyze")return void await this._prepareSample();
+    if(a==="capture-copy")return void await this._copy(this._editor?.captureUrl||"");
+    if(a==="capture-check")return void await this._pollCapture();
+    if(a==="save")return void await this._save();
   }
-
-  set panel(panel) {
-    this._panel = panel;
-  }
-
-  connectedCallback() {
-    this._render();
-    if (!this._pollTimer) {
-      this._pollTimer = window.setInterval(() => {
-        if (document.visibilityState === "visible") {
-          void this._load(true);
-        }
-      }, 15000);
-    }
-  }
-
-  disconnectedCallback() {
-    if (this._pollTimer) {
-      window.clearInterval(this._pollTimer);
-      this._pollTimer = null;
-    }
-  }
-
-  async _load(silent = false) {
-    if (!this._hass || this._loading) return;
-    this._loading = true;
-    if (!silent) this._render();
-
-    try {
-      this._data = await this._hass.connection.sendMessagePromise({
-        type: "http_data_bridge/sources",
-      });
-      this._error = null;
-      this._loaded = true;
-    } catch (err) {
-      this._error = err instanceof Error ? err.message : String(err);
-    } finally {
-      this._loading = false;
-      this._render();
-    }
-  }
-
-  _handleClick(event) {
-    const target = event.target instanceof Element ? event.target.closest("button") : null;
-    if (!target) return;
-
-    const action = target.dataset.action;
-    if (action === "refresh") {
-      void this._load();
-      return;
-    }
-    if (action === "manage") {
-      window.history.pushState(null, "", "/config/integrations/integration/http_data_bridge");
-      window.dispatchEvent(new Event("location-changed"));
-      return;
-    }
-    if (action === "close-value") {
-      this._viewing = null;
-      this._viewError = null;
-      this._render();
-      return;
-    }
-
-    const sourceId = target.dataset.sourceId;
-    if (!sourceId || !this._data) return;
-    const source = this._data.sources.find((item) => item.source_id === sourceId);
-    if (!source) return;
-
-    if (action === "reveal") {
-      if (this._revealed.has(sourceId)) this._revealed.delete(sourceId);
-      else this._revealed.add(sourceId);
-      this._render();
-      return;
-    }
-    if (action === "copy") {
-      void this._copy(source.webhook_url, source.name);
-      return;
-    }
-    if (action === "view-value") {
-      const path = target.dataset.path ?? "";
-      const field = source.fields.find((item) => item.path === path);
-      if (field) void this._viewAttributeValue(source, field);
-    }
-  }
-
-  async _viewAttributeValue(source, field) {
-    if (!this._hass || this._viewLoading) return;
-    this._viewLoading = true;
-    this._viewError = null;
-    this._viewing = {
-      sourceName: source.name,
-      fieldName: field.name,
-      path: field.path,
-      available: false,
-      value: null,
-    };
-    this._render();
-
-    try {
-      const result = await this._hass.connection.sendMessagePromise({
-        type: "http_data_bridge/attribute_value",
-        source_id: source.source_id,
-        path: field.path,
-      });
-      this._viewing = {
-        ...this._viewing,
-        available: Boolean(result.available),
-        value: result.value,
-      };
-    } catch (err) {
-      this._viewError = err instanceof Error ? err.message : String(err);
-    } finally {
-      this._viewLoading = false;
-      this._render();
-    }
-  }
-
-  async _copy(text, sourceName) {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch (_err) {
-      const input = document.createElement("textarea");
-      input.value = text;
-      input.style.position = "fixed";
-      input.style.opacity = "0";
-      document.body.appendChild(input);
-      input.focus();
-      input.select();
-      document.execCommand("copy");
-      input.remove();
-    }
-    this._copyMessage = `Copied ${sourceName} webhook URL`;
-    this._render();
-    window.setTimeout(() => {
-      if (this._copyMessage) {
-        this._copyMessage = "";
-        this._render();
-      }
-    }, 2500);
-  }
-
-  _escape(value) {
-    return String(value ?? "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#039;");
-  }
-
-  _formatValue(value) {
-    let text;
-    if (value === null) text = "null";
-    else if (typeof value === "string") text = value;
-    else text = JSON.stringify(value);
-    if (text.length > 160) text = `${text.slice(0, 159)}…`;
-    return this._escape(text);
-  }
-
-  _formatFullValue(value) {
-    if (typeof value === "string") return value;
-    return JSON.stringify(value, null, 2);
-  }
-
-  _formatTime(value) {
-    if (!value) return "Never";
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? this._escape(value) : this._escape(date.toLocaleString());
-  }
-
-  _statusLabel(status) {
-    return {
-      available: "Receiving data",
-      stale: "Stale",
-      waiting: "Waiting for first payload",
-      disabled: "Disabled",
-      unloaded: "Not loaded",
-    }[status] || status;
-  }
-
-  _reachability(source) {
-    if (source.local_only) return "Local network only";
-    if (source.uses_cloudhook) return "Nabu Casa cloudhook";
-    return "Home Assistant webhook URL";
-  }
-
-  _sourceCard(source) {
-    const revealed = this._revealed.has(source.source_id);
-    const staleText = source.stale_after > 0 ? `${source.stale_after} seconds` : "Never expires";
-    const fields = source.fields.length
-      ? source.fields
-          .map((field) => {
-            const typeText = field.attribute_backed
-              ? "sensor · attribute storage"
-              : `${field.platform}${field.unit ? ` · ${this._escape(field.unit)}` : ""}`;
-            let currentValue = "Unavailable";
-            if (field.available && field.attribute_backed) {
-              currentValue = `<button class="link-button" data-action="view-value" data-source-id="${this._escape(
-                source.source_id
-              )}" data-path="${this._escape(field.path)}">View value</button>`;
-            } else if (field.available) {
-              currentValue = this._formatValue(field.value);
-            }
-
-            return `
-              <tr>
-                <td>
-                  <div class="field-name">${this._escape(field.name)}</div>
-                  <div class="field-path">${this._escape(field.path_label)}</div>
-                </td>
-                <td>${typeText}</td>
-                <td class="value ${field.available ? "" : "muted"}">${currentValue}</td>
-              </tr>`;
-          })
-          .join("")
-      : `<tr><td colspan="3" class="muted">No mapped fields</td></tr>`;
-
-    return `
-      <section class="card">
-        <div class="card-head">
-          <div>
-            <h2>${this._escape(source.name)}</h2>
-            <div class="meta">${this._reachability(source)}</div>
-          </div>
-          <span class="status status-${this._escape(source.status)}">${this._escape(
-            this._statusLabel(source.status)
-          )}</span>
-        </div>
-
-        <div class="stats">
-          <div><span>Last received</span><strong>${this._formatTime(source.last_received)}</strong></div>
-          <div><span>Stale timeout</span><strong>${this._escape(staleText)}</strong></div>
-          <div><span>Mapped values</span><strong>${source.fields.length}</strong></div>
-        </div>
-
-        <div class="secret-block">
-          <label>Webhook URL</label>
-          <div class="secret-row">
-            <input readonly type="${revealed ? "text" : "password"}" value="${this._escape(
-              source.webhook_url
-            )}" aria-label="${this._escape(source.name)} webhook URL">
-            <button data-action="reveal" data-source-id="${this._escape(source.source_id)}">${
-              revealed ? "Hide" : "Show"
-            }</button>
-            <button class="primary-small" data-action="copy" data-source-id="${this._escape(
-              source.source_id
-            )}">Copy</button>
-          </div>
-          <div class="warning">Treat this URL like a password. Anyone who knows it can submit data to this source.</div>
-        </div>
-
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Value</th><th>Entity type</th><th>Current value</th></tr></thead>
-            <tbody>${fields}</tbody>
-          </table>
-        </div>
-      </section>`;
-  }
-
-  _valueDialog() {
-    if (!this._viewing) return "";
-    let body;
-    if (this._viewLoading) {
-      body = `<div class="modal-message">Loading value…</div>`;
-    } else if (this._viewError) {
-      body = `<div class="modal-message error">${this._escape(this._viewError)}</div>`;
-    } else if (!this._viewing.available) {
-      body = `<div class="modal-message muted">This value is currently unavailable.</div>`;
-    } else {
-      body = `<pre>${this._escape(this._formatFullValue(this._viewing.value))}</pre>`;
-    }
-
-    return `
-      <div class="modal-backdrop">
-        <section class="modal" role="dialog" aria-modal="true">
-          <div class="modal-head">
-            <div>
-              <h2>${this._escape(this._viewing.fieldName)}</h2>
-              <div class="meta">${this._escape(this._viewing.sourceName)} · ${this._escape(
-                this._viewing.path || "$"
-              )}</div>
-            </div>
-            <button data-action="close-value">Close</button>
-          </div>
-          ${body}
-        </section>
-      </div>`;
-  }
-
-  _render() {
-    if (!this.shadowRoot) return;
-    const sources = this._data?.sources || [];
-    const body = this._error
-      ? `<div class="message error">Could not load HTTP Data Bridge: ${this._escape(this._error)}</div>`
-      : !this._loaded
-        ? `<div class="message">Loading sources…</div>`
-        : sources.length === 0
-          ? `<div class="message">No push sources are configured yet. Open integration settings to add one.</div>`
-          : sources.map((source) => this._sourceCard(source)).join("");
-
-    this.shadowRoot.innerHTML = `
-      <style>
-        :host { display: block; min-height: 100%; background: var(--primary-background-color); color: var(--primary-text-color); }
-        * { box-sizing: border-box; }
-        .page { max-width: 1120px; margin: 0 auto; padding: 24px; }
-        header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
-        h1 { margin: 0 0 6px; font-size: 28px; font-weight: 600; }
-        .subtitle { color: var(--secondary-text-color); max-width: 700px; line-height: 1.45; }
-        .actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-        button { border: 1px solid var(--divider-color); background: var(--card-background-color); color: var(--primary-text-color); border-radius: 8px; padding: 9px 13px; cursor: pointer; font: inherit; }
-        button:hover { background: var(--secondary-background-color); }
-        .primary { background: var(--primary-color); color: var(--text-primary-color, white); border-color: var(--primary-color); }
-        .primary-small { background: var(--primary-color); color: var(--text-primary-color, white); border-color: var(--primary-color); }
-        .link-button { padding: 4px 8px; color: var(--primary-color); }
-        .copy-message { margin: -8px 0 16px; color: var(--success-color, #43a047); font-size: 14px; }
-        .card { background: var(--card-background-color); border-radius: var(--ha-card-border-radius, 12px); box-shadow: var(--ha-card-box-shadow, 0 2px 6px rgba(0,0,0,.12)); padding: 20px; margin-bottom: 18px; }
-        .card-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
-        h2 { margin: 0 0 4px; font-size: 21px; }
-        .meta, .muted { color: var(--secondary-text-color); }
-        .status { font-size: 12px; font-weight: 600; border-radius: 999px; padding: 5px 9px; background: var(--secondary-background-color); white-space: nowrap; }
-        .status-available { color: var(--success-color, #43a047); }
-        .status-stale { color: var(--warning-color, #fb8c00); }
-        .status-disabled, .status-unloaded { color: var(--secondary-text-color); }
-        .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 18px 0; }
-        .stats div { background: var(--secondary-background-color); border-radius: 9px; padding: 12px; min-width: 0; }
-        .stats span { display: block; color: var(--secondary-text-color); font-size: 12px; margin-bottom: 4px; }
-        .stats strong { display: block; overflow-wrap: anywhere; font-size: 14px; }
-        .secret-block { margin: 16px 0 20px; }
-        .secret-block label { display: block; font-weight: 600; margin-bottom: 7px; }
-        .secret-row { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; }
-        input { min-width: 0; width: 100%; padding: 10px 11px; border: 1px solid var(--divider-color); border-radius: 8px; background: var(--primary-background-color); color: var(--primary-text-color); font: inherit; }
-        .warning { color: var(--secondary-text-color); font-size: 12px; margin-top: 7px; }
-        .table-wrap { overflow-x: auto; }
-        table { width: 100%; border-collapse: collapse; font-size: 14px; }
-        th { text-align: left; color: var(--secondary-text-color); font-weight: 500; padding: 8px; border-bottom: 1px solid var(--divider-color); }
-        td { padding: 10px 8px; border-bottom: 1px solid var(--divider-color); vertical-align: top; }
-        tbody tr:last-child td { border-bottom: 0; }
-        .field-name { font-weight: 500; }
-        .field-path { color: var(--secondary-text-color); font-family: monospace; font-size: 12px; margin-top: 2px; }
-        .value { overflow-wrap: anywhere; max-width: 380px; }
-        .message { background: var(--card-background-color); border-radius: 12px; padding: 24px; color: var(--secondary-text-color); }
-        .error { color: var(--error-color); }
-        .modal-backdrop { position: fixed; inset: 0; z-index: 20; background: rgba(0,0,0,.48); display: flex; align-items: center; justify-content: center; padding: 20px; }
-        .modal { width: min(900px, 100%); max-height: 85vh; overflow: auto; background: var(--card-background-color); border-radius: var(--ha-card-border-radius, 12px); box-shadow: 0 8px 30px rgba(0,0,0,.35); padding: 20px; }
-        .modal-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 16px; }
-        .modal pre { margin: 0; padding: 14px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--primary-background-color); border-radius: 8px; font-family: monospace; }
-        .modal-message { padding: 18px 0; }
-        @media (max-width: 700px) {
-          .page { padding: 16px; }
-          header { flex-direction: column; }
-          .actions { justify-content: flex-start; }
-          .stats { grid-template-columns: 1fr; }
-          .secret-row { grid-template-columns: 1fr 1fr; }
-          .secret-row input { grid-column: 1 / -1; }
-          .card { padding: 16px; }
-        }
-      </style>
-      <div class="page">
-        <header>
-          <div>
-            <h1>HTTP Data Bridge</h1>
-            <div class="subtitle">Push sources, selected values, freshness and webhook endpoints. Incoming payloads are not retained here beyond the values you explicitly mapped.</div>
-          </div>
-          <div class="actions">
-            <button data-action="refresh" ${this._loading ? "disabled" : ""}>${this._loading ? "Refreshing…" : "Refresh"}</button>
-            <button class="primary" data-action="manage">Manage sources</button>
-          </div>
-        </header>
-        ${this._copyMessage ? `<div class="copy-message">${this._escape(this._copyMessage)}</div>` : ""}
-        ${body}
-      </div>
-      ${this._valueDialog()}`;
-  }
+  _validateSettings(){if(!this._editor.name.trim())return"Enter a source name.";const n=Number(this._editor.staleAfter);if(!Number.isInteger(n)||n<0)return"Stale timeout must be a non-negative whole number.";return"";}
+  async _next(){const err=this._validateSettings();if(err){this._error=err;this._render();return;}this._error="";if(this._editor.mode==="edit"&&this._editor.method==="keep")return void await this._save();if(this._editor.method==="paste"){this._editor.step="sample";this._render();return;}await this._startCapture();}
+  async _back(){if(this._editor.step==="mappings"){this._editor.step=this._editor.method==="paste"?"sample":"capture";if(this._editor.step==="capture")this._startCapturePoll();}else{await this._cancelCurrentDraft();this._editor.step="settings";}this._error="";this._render();}
+  async _prepareSample(){this._busy=true;this._render();try{await this._cancelCurrentDraft();const r=await this._ws("source/prepare_sample",{sample_payload:this._editor.sample});this._editor.draftId=r.draft_id;this._editor.nodes=r.nodes;this._primeMappings();this._editor.step="mappings";this._error="";}catch(e){this._error=this._err(e);}finally{this._busy=false;this._render();}}
+  async _startCapture(){this._busy=true;this._render();try{await this._cancelCurrentDraft();const r=await this._ws("source/capture/start",{source_name:this._editor.name,local_only:!!this._editor.localOnly});this._editor.draftId=r.draft_id;this._editor.captureUrl=r.capture_url;this._editor.step="capture";this._error="";this._startCapturePoll();}catch(e){this._error=this._err(e);}finally{this._busy=false;this._render();}}
+  _startCapturePoll(){this._stopCapture();this._captureTimer=setInterval(()=>void this._pollCapture(true),1800);}
+  _stopCapture(){if(this._captureTimer){clearInterval(this._captureTimer);this._captureTimer=null;}}
+  async _pollCapture(silent=false){if(!this._editor?.draftId)return;try{const r=await this._ws("source/capture/status",{draft_id:this._editor.draftId});if(r.captured){this._stopCapture();this._editor.nodes=r.nodes;this._primeMappings();this._editor.step="mappings";this._error="";this._render();}else if(!silent)this._render();}catch(e){this._stopCapture();this._error=this._err(e);this._render();}}
+  _primeMappings(){const valid=new Set(this._editor.nodes.map(n=>n.path));for(const p of [...this._editor.mappings.keys()])if(!valid.has(p))this._editor.mappings.delete(p);for(const n of this._editor.nodes){const old=this._editor.existing.find(x=>x.path===n.path);if(old&&!this._editor.mappings.has(n.path))this._editor.mappings.set(n.path,this._defaultMap(n));}}
+  _mappingError(){if(!this._editor.mappings.size)return"Select at least one value.";for(const m of this._editor.mappings.values()){if(!m.name.trim())return"Every selected value needs an entity name.";const n=this._editor.nodes.find(x=>x.path===m.path);if(m.platform==="binary_sensor"&&!n?.is_boolean)return`${n?.label||m.path} is not true/false.`;if(n?.requires_attribute&&!m.store_in_attribute)return`${n.label} must use attribute storage.`;if(m.store_in_attribute&&m.unit)return"Attribute-backed sensors cannot have a unit.";if(m.unit&&!n?.is_number)return"Units require numeric sample values.";}return"";}
+  async _save(){if(this._busy)return;const keep=this._editor.mode==="edit"&&this._editor.method==="keep";if(!keep){const err=this._mappingError();if(err){this._error=err;this._render();return;}}this._busy=true;this._render();try{const data={name:this._editor.name.trim(),enabled:!!this._editor.enabled,local_only:!!this._editor.localOnly,stale_after:Number(this._editor.staleAfter),replace_mappings:!keep,fields:keep?[]:[...this._editor.mappings.values()].map(m=>({path:m.path,name:m.name.trim(),platform:m.platform,...(m.store_in_attribute?{store_in_attribute:true}:{}),...(!m.store_in_attribute&&m.unit.trim()?{unit:m.unit.trim()}:{} )}))};if(this._editor.sourceId)data.source_id=this._editor.sourceId;if(!keep)data.draft_id=this._editor.draftId;await this._ws("source/save",data);this._editor.draftId=null;this._stopCapture();this._editor=null;this._error="";await this._load(true);}catch(e){this._error=this._err(e);}finally{this._busy=false;this._render();}}
+  async _deleteSource(){if(!this._delete||this._busy)return;this._busy=true;this._render();try{await this._ws("source/delete",{source_id:this._delete.source_id});this._delete=null;this._error="";await this._load(true);}catch(e){this._error=this._err(e);}finally{this._busy=false;this._render();}}
+  async _closeEditor(){await this._cancelCurrentDraft();this._editor=null;this._error="";this._render();}
+  async _cancelCurrentDraft(){this._stopCapture();const id=this._editor?.draftId;if(id){this._editor.draftId=null;try{await this._cancelDraft(id);}catch(_e){}}}
+  async _cancelDraft(id){return this._ws("source/draft/cancel",{draft_id:id});}
+  async _viewValue(source,path){const f=source.fields.find(x=>x.path===path);if(!f)return;this._view={title:f.name,source:source.name,path,loading:true,value:null,available:false,error:""};this._render();try{const r=await this._ws("attribute_value",{source_id:source.source_id,path});Object.assign(this._view,{loading:false,value:r.value,available:!!r.available});}catch(e){Object.assign(this._view,{loading:false,error:this._err(e)});}this._render();}
+  async _copy(text){try{await navigator.clipboard.writeText(text);}catch(_e){const t=document.createElement("textarea");t.value=text;document.body.append(t);t.select();document.execCommand("copy");t.remove();}}
+  _esc(v){return String(v??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('\"',"&quot;").replaceAll("'","&#039;");}
+  _time(v){if(!v)return"Never";const d=new Date(v);return Number.isNaN(d.getTime())?this._esc(v):this._esc(d.toLocaleString());}
+  _status(s){return({available:"Receiving data",stale:"Stale",waiting:"Waiting for first payload",disabled:"Disabled",unloaded:"Not loaded"})[s]||s;}
+  _card(s){const fields=s.fields.map(f=>`<tr><td><b>${this._esc(f.name)}</b><small>${this._esc(f.path_label)}</small></td><td>${f.attribute_backed?"Sensor · attribute":this._esc(f.platform)+(f.unit?` · ${this._esc(f.unit)}`:"")}</td><td>${!f.available?"<span class=muted>Unavailable</span>":f.attribute_backed?`<button data-action=view data-id="${this._esc(s.source_id)}" data-path="${this._esc(f.path)}">View</button>`:this._esc(typeof f.value==="string"?f.value:JSON.stringify(f.value))}</td></tr>`).join("");const shown=this._revealed.has(s.source_id);return`<section class=card><div class=row><div><h2>${this._esc(s.name)}</h2><small>${s.local_only?"Local network only":s.uses_cloudhook?"Nabu Casa cloudhook":"Home Assistant webhook URL"}</small></div><div class=actions><span class="status ${s.status}">${this._esc(this._status(s.status))}</span><button data-action=edit data-id="${s.source_id}">Edit</button><button class=dangerText data-action=delete data-id="${s.source_id}">Delete</button></div></div><div class=stats><div><small>Last received</small><b>${this._time(s.last_received)}</b></div><div><small>Stale timeout</small><b>${s.stale_after?`${s.stale_after}s`:"Never"}</b></div><div><small>Mapped values</small><b>${s.fields.length}</b></div></div><label>Webhook URL</label><div class=url><input readonly type=${shown?"text":"password"} value="${this._esc(s.webhook_url)}"><button data-action=reveal data-id="${s.source_id}">${shown?"Hide":"Show"}</button><button data-action=copy data-id="${s.source_id}">Copy</button></div><small>Treat this URL like a password.</small><div class=table><table><thead><tr><th>Value</th><th>Type</th><th>Current</th></tr></thead><tbody>${fields}</tbody></table></div></section>`;}
+  _settingsStep(){const e=this._editor;return`<div class=form><label>Source name<input data-key=name value="${this._esc(e.name)}"></label><label>Mark unavailable after (seconds)<input data-key=stale type=number min=0 step=1 value="${this._esc(e.staleAfter)}"><small>0 keeps the latest value available indefinitely.</small></label><label class=check><input data-key=enabled type=checkbox ${e.enabled?"checked":""}>Enable source</label><label class=check><input data-key=local type=checkbox ${e.localOnly?"checked":""}>Only allow local network requests</label><h3>${e.mode==="edit"?"Entity mappings":"How should the payload be discovered?"}</h3>${e.mode==="edit"?`<label class=check><input data-key=method type=radio name=method value=keep ${e.method==="keep"?"checked":""}>Keep current mappings</label>`:""}<label class=check><input data-key=method type=radio name=method value=live ${e.method==="live"?"checked":""}>Capture a live request</label><label class=check><input data-key=method type=radio name=method value=paste ${e.method==="paste"?"checked":""}>Paste example JSON</label></div>`;}
+  _mappingStep(){const e=this._editor;return`<p class=muted>Select the values to expose, then configure each entity.</p><div class=mappings>${e.nodes.map(n=>{const m=e.mappings.get(n.path),selected=!!m;return`<div class="mapping ${selected?"selected":""}"><label class=check><input type=checkbox data-field=selected data-path="${this._esc(n.path)}" ${selected?"checked":""}><span><b>${this._esc(n.label)}</b> <span class=muted>— ${this._esc(n.preview)}</span></span></label>${selected?`<div class=mapgrid><label>Entity name<input data-field=name data-path="${this._esc(n.path)}" value="${this._esc(m.name)}"></label><label>Entity type<select data-field=platform data-path="${this._esc(n.path)}"><option value=sensor ${m.platform==="sensor"?"selected":""}>Sensor</option>${n.is_boolean?`<option value=binary_sensor ${m.platform==="binary_sensor"?"selected":""}>Binary sensor</option>`:""}</select></label>${m.platform==="sensor"?`<label class=check><input type=checkbox data-field=store data-path="${this._esc(n.path)}" ${m.store_in_attribute?"checked":""} ${n.requires_attribute?"disabled":""}>Store value in an attribute${n.requires_attribute?" (required)":""}</label>${n.is_number&&!m.store_in_attribute?`<label>Unit (optional)<input data-field=unit data-path="${this._esc(n.path)}" value="${this._esc(m.unit)}"></label>`:""}`:""}</div>`:""}</div>`;}).join("")}</div>`;}
+  _editorDialog(){if(!this._editor)return"";const e=this._editor;let body="",primary="";if(e.step==="settings"){body=this._settingsStep();primary=`<button class=primary data-action=next>${e.mode==="edit"&&e.method==="keep"?"Save":"Next"}</button>`;}if(e.step==="sample"){body=`<p>Paste one representative JSON payload. It is used only during setup.</p><textarea class=json data-key=sample>${this._esc(e.sample)}</textarea>`;primary=`<button class=primary data-action=analyze>Analyze JSON</button>`;}if(e.step==="capture"){body=`<p>Send one JSON POST to this temporary URL. This setup endpoint expires automatically.</p><div class=url><input readonly value="${this._esc(e.captureUrl)}"><button data-action=capture-copy>Copy</button></div><p class=waiting>● Waiting for a valid request…</p><button data-action=capture-check>Check now</button>`;}if(e.step==="mappings"){body=this._mappingStep();primary=`<button class=primary data-action=save>Save source</button>`;}return`<div class=backdrop><section class=modal><div class=row><div><h2>${e.mode==="add"?"Add source":"Edit source"}</h2><small>Step: ${this._esc(e.step)}</small></div><button data-action=editor-cancel>Close</button></div>${this._error?`<div class=error>${this._esc(this._error)}</div>`:""}${body}<footer>${e.step!=="settings"?`<button data-action=back>Back</button>`:""}<span></span>${primary}</footer></section></div>`;}
+  _deleteDialog(){if(!this._delete)return"";return`<div class=backdrop><section class="modal small"><h2>Delete ${this._esc(this._delete.name)}?</h2><p>This removes the source, its webhook, entities and stored latest values. This cannot be undone.</p><footer><button data-action=delete-cancel>Cancel</button><span></span><button class=danger data-action=delete-go>Delete source</button></footer></section></div>`;}
+  _viewDialog(){if(!this._view)return"";let body=this._view.loading?"Loading…":this._view.error?this._esc(this._view.error):!this._view.available?"Unavailable":`<pre>${this._esc(typeof this._view.value==="string"?this._view.value:JSON.stringify(this._view.value,null,2))}</pre>`;return`<div class=backdrop><section class=modal><div class=row><div><h2>${this._esc(this._view.title)}</h2><small>${this._esc(this._view.source)} · ${this._esc(this._view.path||"$")}</small></div><button data-action=view-close>Close</button></div>${body}</section></div>`;}
+  _render(){if(!this.shadowRoot)return;const cards=this._error&&!this._editor?`<div class=card>${this._esc(this._error)}</div>`:!this._data?`<div class=card>Loading…</div>`:this._data.sources.length?this._data.sources.map(s=>this._card(s)).join(""):`<div class="card empty"><h2>No push sources yet</h2><p>Add a source here, then send JSON to its generated webhook.</p><button class=primary data-action=add>Add source</button></div>`;this.shadowRoot.innerHTML=`<style>:host{display:block;min-height:100%;background:var(--primary-background-color);color:var(--primary-text-color)}*{box-sizing:border-box}.page{max-width:1120px;margin:auto;padding:24px}header,.row,.actions,footer{display:flex;gap:10px;align-items:center}.row,header{justify-content:space-between}header{align-items:flex-start;margin-bottom:20px}h1,h2{margin:0 0 6px}.muted,small{color:var(--secondary-text-color)}button{border:1px solid var(--divider-color);background:var(--card-background-color);color:var(--primary-text-color);border-radius:8px;padding:9px 12px;cursor:pointer;font:inherit}.primary{background:var(--primary-color);color:white;border-color:var(--primary-color)}.danger{background:var(--error-color,#d32f2f);color:white}.dangerText{color:var(--error-color,#d32f2f)}.card,.modal{background:var(--card-background-color);border-radius:12px;padding:20px;box-shadow:var(--ha-card-box-shadow,0 2px 7px #0002);margin-bottom:18px}.empty{text-align:center;padding:42px}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:18px 0}.stats>div{background:var(--secondary-background-color);padding:10px;border-radius:8px}.stats small{display:block}.status{font-size:12px;padding:5px 8px;border-radius:99px;background:var(--secondary-background-color)}.available{color:var(--success-color,#43a047)}.stale{color:var(--warning-color,#fb8c00)}.url{display:grid;grid-template-columns:1fr auto auto;gap:8px;margin-top:6px}input,select,textarea{width:100%;padding:10px;border:1px solid var(--divider-color);border-radius:8px;background:var(--primary-background-color);color:var(--primary-text-color);font:inherit}.table{overflow:auto;margin-top:16px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;border-bottom:1px solid var(--divider-color);vertical-align:top}.backdrop{position:fixed;inset:0;background:#0008;z-index:20;display:flex;align-items:center;justify-content:center;padding:16px}.modal{width:min(900px,100%);max-height:92vh;overflow:auto;margin:0}.modal.small{width:min(500px,100%)}.form,.mappings{display:grid;gap:14px}.form label:not(.check){font-weight:600}.check{display:flex;gap:9px;align-items:flex-start}.check input{width:auto}.json{min-height:260px;font-family:monospace}.mapping{border:1px solid var(--divider-color);border-radius:9px;padding:11px}.mapping.selected{border-color:var(--primary-color)}.mapgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0 0 27px;padding-top:12px;border-top:1px solid var(--divider-color)}.mapgrid .check{grid-column:1/-1}.error{color:var(--error-color);background:var(--secondary-background-color);padding:10px;border-radius:8px;margin:12px 0}.waiting{color:var(--secondary-text-color)}footer{margin-top:18px;padding-top:14px;border-top:1px solid var(--divider-color)}footer span{flex:1}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--secondary-background-color);padding:12px;border-radius:8px}@media(max-width:700px){.page{padding:14px}header,.row{align-items:flex-start;flex-direction:column}.stats,.mapgrid{grid-template-columns:1fr}.url{grid-template-columns:1fr 1fr}.url input{grid-column:1/-1}.backdrop{align-items:flex-end;padding:0}.modal{border-radius:12px 12px 0 0}.actions{flex-wrap:wrap}}</style><div class=page><header><div><h1>HTTP Data Bridge</h1><div class=muted>Add, edit and remove push sources here.</div></div><div class=actions><button data-action=refresh>${this._busy?"Working…":"Refresh"}</button><button data-action=settings>HA settings</button><button class=primary data-action=add>Add source</button></div></header>${cards}</div>${this._viewDialog()}${this._editorDialog()}${this._deleteDialog()}`;}
 }
-
-if (!customElements.get("http-data-bridge-panel")) {
-  customElements.define("http-data-bridge-panel", HttpDataBridgePanel);
-}
+if(!customElements.get("http-data-bridge-panel"))customElements.define("http-data-bridge-panel",HttpDataBridgePanel);
