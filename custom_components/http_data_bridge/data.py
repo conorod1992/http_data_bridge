@@ -25,6 +25,7 @@ from .const import (
     CONF_WEBHOOK_ID,
     DOMAIN,
     FIELD_PATH,
+    FIELD_STORE_IN_ATTRIBUTE,
     STORAGE_SAVE_DELAY,
     STORAGE_VERSION,
     SUBENTRY_TYPE_SOURCE,
@@ -236,7 +237,10 @@ class HttpDataBridgeRuntime:
                 value = get_by_pointer(payload, path)
             except KeyError:
                 continue
-            if isinstance(value, (dict, list)):
+
+            if isinstance(value, (dict, list)) and not bool(
+                field.get(FIELD_STORE_IN_ATTRIBUTE, False)
+            ):
                 continue
             new_values[path] = value
 
