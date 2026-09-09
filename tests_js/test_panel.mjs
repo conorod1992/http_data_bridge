@@ -72,7 +72,7 @@ assert.equal(containerMapping.store_in_attribute, true);
 const blankBuilder = panel._newBuilder("https://example.test/webhook");
 blankBuilder.open = true;
 const beforeGenerateHtml = panel._builderHtml(blankBuilder);
-assert.match(beforeGenerateHtml, />Generate</);
+assert.match(beforeGenerateHtml, /\+ Add value<\/button><button class="primary"[^>]*>Generate<\/button>/);
 assert.doesNotMatch(beforeGenerateHtml, /Give every example value a name/);
 assert.doesNotMatch(beforeGenerateHtml, /Ready-to-use code/);
 assert.doesNotMatch(beforeGenerateHtml, /JSON request preview/);
@@ -150,5 +150,48 @@ assert.doesNotMatch(panel._builderHtml(builder), /Enter valid JSON to generate c
 assert.equal(panel._generateBuilder(builder), false);
 assert.equal(builder.generationError, "Enter valid JSON to generate code.");
 assert.match(panel._builderHtml(builder), /Enter valid JSON to generate code/);
+
+// Builder field edits must not rebuild the whole panel. A full render resets the
+// modal's scroll/focus and was what made adding/editing rows feel unreliable.
+const stableBuilder = panel._newBuilder("https://example.test/webhook");
+stableBuilder.rows = [{ id: "stable", name: "status", type: "text", value: "running" }];
+panel._sender = { source: {}, builder: stableBuilder };
+let renderCount = 0;
+panel._render = () => { renderCount += 1; };
+
+const nameInput = new HTMLInputElement();
+nameInput.dataset = {
+  builder: stableBuilder.id,
+  builderIndex: "0",
+  builderField: "name",
+};
+nameInput.value = "state";
+panel._change({ target: nameInput });
+assert.equal(renderCount, 0, "leaving a builder text input must not rerender the panel");
+assert.equal(stableBuilder.rows[0].name, "state");
+
+let replacedRow = "";
+const typeSelect = new HTMLSelectElement();
+typeSelect.dataset = {
+  builder: stableBuilder.id,
+  builderIndex: "0",
+  builderField: "type",
+};
+typeSelect.value = "boolean";
+typeSelect.closest = () => ({
+  set outerHTML(value) {
+    replacedRow = value;
+  },
+});
+panel._change({ target: typeSelect });
+assert.equal(renderCount, 0, "changing builder type must not rerender the panel");
+assert.equal(stableBuilder.rows[0].type, "boolean");
+assert.match(replacedRow, />Yes<\/option>/, "only the changed row should switch to a Yes/No control");
+
+const jsonInput = new HTMLTextAreaElement();
+jsonInput.dataset = { builder: stableBuilder.id, builderJson: "" };
+jsonInput.value = '{"status":"ok"}';
+panel._change({ target: jsonInput });
+assert.equal(renderCount, 0, "leaving the JSON editor must not rerender the panel");
 
 console.log("HTTP Data Bridge panel helper tests passed");

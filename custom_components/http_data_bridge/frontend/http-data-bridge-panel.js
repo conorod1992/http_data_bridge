@@ -110,6 +110,22 @@ class HttpDataBridgePanel extends HTMLElement {
     builder.generated = false;
     builder.generatedValue = null;
     builder.generationError = "";
+
+    // Keep field editing stable: invalidate only this builder's generated UI
+    // instead of rebuilding the whole panel and resetting scroll/focus.
+    const shell = this.shadowRoot?.querySelector?.(
+      `[data-builder-shell="${builder.id}"]`,
+    );
+    if (!shell) return;
+    const output = shell.querySelector?.("[data-builder-output]");
+    if (output) output.innerHTML = "";
+    const error = shell.querySelector?.("[data-builder-error]");
+    if (error) {
+      error.textContent = "";
+      error.hidden = true;
+    }
+    const generate = shell.querySelector?.('[data-action="builder-generate"]');
+    if (generate) generate.textContent = "Generate";
   }
 
   _newEditor(source = null) {
@@ -187,7 +203,8 @@ class HttpDataBridgePanel extends HTMLElement {
     const rowIndex = target.dataset.builderIndex;
     const builderField = target.dataset.builderField;
     if (builder && rowIndex !== undefined && builderField) {
-      const row = builder.rows[Number(rowIndex)];
+      const index = Number(rowIndex);
+      const row = builder.rows[index];
       if (row) {
         row[builderField] = target.value;
         if (builderField === "type" && row.type === "boolean" && !["true", "false"].includes(row.value)) {
@@ -195,13 +212,15 @@ class HttpDataBridgePanel extends HTMLElement {
         }
       }
       this._invalidateBuilder(builder);
-      this._render();
+      if (row && builderField === "type") {
+        const rowElement = target.closest?.(".builder-row");
+        if (rowElement) rowElement.outerHTML = this._builderRowHtml(builder, row, index);
+      }
       return;
     }
     if (builder && target.dataset.builderJson !== undefined) {
       builder.json = target.value;
       this._invalidateBuilder(builder);
-      this._render();
       return;
     }
 
@@ -1157,23 +1176,28 @@ class HttpDataBridgePanel extends HTMLElement {
     };
   }
 
+  _builderValueControlHtml(builder, row, index) {
+    return row.type === "boolean"
+      ? `<select data-builder="${builder.id}" data-builder-index="${index}" data-builder-field="value"><option value="true" ${row.value === "true" ? "selected" : ""}>Yes</option><option value="false" ${row.value === "false" ? "selected" : ""}>No</option></select>`
+      : `<input data-builder="${builder.id}" data-builder-index="${index}" data-builder-field="value" ${row.type === "number" ? 'type="number" step="any"' : ""} value="${this._esc(row.value)}" placeholder="${row.type === "number" ? "e.g. 21.5" : "e.g. running"}">`;
+  }
+
+  _builderRowHtml(builder, row, index) {
+    return `<div class="builder-row">
+      <input data-builder="${builder.id}" data-builder-index="${index}" data-builder-field="name" value="${this._esc(row.name)}" placeholder="Name, e.g. temperature">
+      <select data-builder="${builder.id}" data-builder-index="${index}" data-builder-field="type">
+        <option value="text" ${row.type === "text" ? "selected" : ""}>Text</option>
+        <option value="number" ${row.type === "number" ? "selected" : ""}>Number</option>
+        <option value="boolean" ${row.type === "boolean" ? "selected" : ""}>Yes / No</option>
+      </select>
+      ${this._builderValueControlHtml(builder, row, index)}
+      <button class="icon-button" data-action="builder-remove" data-builder="${builder.id}" data-builder-index="${index}" title="Remove value">×</button>
+    </div>`;
+  }
+
   _builderRowsHtml(builder) {
     return builder.rows
-      .map((row, index) => {
-        const valueControl = row.type === "boolean"
-          ? `<select data-builder="${builder.id}" data-builder-index="${index}" data-builder-field="value"><option value="true" ${row.value === "true" ? "selected" : ""}>Yes</option><option value="false" ${row.value === "false" ? "selected" : ""}>No</option></select>`
-          : `<input data-builder="${builder.id}" data-builder-index="${index}" data-builder-field="value" ${row.type === "number" ? 'type="number" step="any"' : ""} value="${this._esc(row.value)}" placeholder="${row.type === "number" ? "e.g. 21.5" : "e.g. running"}">`;
-        return `<div class="builder-row">
-          <input data-builder="${builder.id}" data-builder-index="${index}" data-builder-field="name" value="${this._esc(row.name)}" placeholder="Name, e.g. temperature">
-          <select data-builder="${builder.id}" data-builder-index="${index}" data-builder-field="type">
-            <option value="text" ${row.type === "text" ? "selected" : ""}>Text</option>
-            <option value="number" ${row.type === "number" ? "selected" : ""}>Number</option>
-            <option value="boolean" ${row.type === "boolean" ? "selected" : ""}>Yes / No</option>
-          </select>
-          ${valueControl}
-          <button class="icon-button" data-action="builder-remove" data-builder="${builder.id}" data-builder-index="${index}" title="Remove value">×</button>
-        </div>`;
-      })
+      .map((row, index) => this._builderRowHtml(builder, row, index))
       .join("");
   }
 
@@ -1188,16 +1212,23 @@ class HttpDataBridgePanel extends HTMLElement {
         </div>
         ${codeResult.error ? `<div class="code-placeholder">${this._esc(codeResult.error)}</div>` : `<div class="code-box"><pre>${this._esc(codeResult.code)}</pre><button data-action="builder-copy" data-builder="${builder.id}">${this._esc(this._feedbackText(copyKey, "Copy code"))}</button></div>`}`
       : "";
-    const content = `<div class="builder-content">
+    const generateButton = `<button class="primary" data-action="builder-generate" data-builder="${builder.id}">${builder.generated ? "Generate again" : "Generate"}</button>`;
+    const editor = builder.mode === "fields"
+      ? `<div class="builder-labels"><span>Name</span><span>Type</span><span>Example value</span><span></span></div>
+        ${this._builderRowsHtml(builder)}
+        <div class="builder-actions"><button class="secondary add-value" data-action="builder-add" data-builder="${builder.id}">+ Add value</button>${generateButton}</div>`
+      : `<textarea class="builder-json" data-builder="${builder.id}" data-builder-json spellcheck="false">${this._esc(builder.json)}</textarea>
+        <div class="builder-actions">${generateButton}</div>`;
+    const content = `<div class="builder-content" data-builder-shell="${builder.id}">
       <p>Add some example values your application might send. Nothing is validated until you choose <b>Generate</b>.</p>
       <div class="segmented">
         <button data-action="builder-mode" data-builder="${builder.id}" data-mode="fields" class="${builder.mode === "fields" ? "active" : ""}">Simple values</button>
         <button data-action="builder-mode" data-builder="${builder.id}" data-mode="json" class="${builder.mode === "json" ? "active" : ""}">Edit JSON directly</button>
       </div>
-      ${builder.mode === "fields" ? `<div class="builder-labels"><span>Name</span><span>Type</span><span>Example value</span><span></span></div>${this._builderRowsHtml(builder)}<button class="secondary add-value" data-action="builder-add" data-builder="${builder.id}">+ Add value</button>` : `<textarea class="builder-json" data-builder="${builder.id}" data-builder-json spellcheck="false">${this._esc(builder.json)}</textarea>`}
-      <div class="builder-generate"><button class="primary" data-action="builder-generate" data-builder="${builder.id}">${builder.generated ? "Generate again" : "Generate"}</button><small>We'll validate the example and show the code only after you generate it.</small></div>
-      ${builder.generationError ? `<div class="inline-error">${this._esc(builder.generationError)}</div>` : ""}
-      ${generated}
+      ${editor}
+      <small>Generate validates the current example and then shows the JSON preview and sender code.</small>
+      <div class="inline-error" data-builder-error ${builder.generationError ? "" : "hidden"}>${this._esc(builder.generationError)}</div>
+      <div data-builder-output>${generated}</div>
       <small>This is only a helper. HTTP Data Bridge does not require a predefined schema; you can send any valid JSON within the normal payload limit.</small>
     </div>`;
 
@@ -1284,7 +1315,7 @@ class HttpDataBridgePanel extends HTMLElement {
       .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10;display:flex;align-items:center;justify-content:center;padding:20px}.modal{background:var(--surface);border-radius:14px;width:min(920px,100%);max-height:calc(100vh - 40px);display:flex;flex-direction:column;box-shadow:0 16px 50px rgba(0,0,0,.3)}.modal.large{width:min(1000px,100%)}.modal.small{width:min(480px,100%)}.modal-head,.modal-footer{padding:18px 20px;display:flex;align-items:center;justify-content:space-between;gap:16px}.modal-head{border-bottom:1px solid var(--border)}.modal-footer{border-top:1px solid var(--border)}.modal-body{padding:20px;overflow:auto}.error,.inline-error{padding:11px 14px;border-radius:8px;background:rgba(198,40,40,.1);color:var(--error-color,#c62828);margin:12px 20px}.inline-error{margin:12px 0}.value-view,pre{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
       .capture-status{display:flex;gap:12px;align-items:flex-start;padding:14px;border-radius:10px;background:rgba(3,169,244,.08)}.capture-status>div{display:grid;gap:3px}.pulse{width:11px;height:11px;border-radius:50%;background:var(--accent);margin-top:5px;box-shadow:0 0 0 0 rgba(3,169,244,.5);animation:pulse 1.8s infinite}@keyframes pulse{70%{box-shadow:0 0 0 8px rgba(3,169,244,0)}100%{box-shadow:0 0 0 0 rgba(3,169,244,0)}}.capture-actions{display:flex;align-items:center;gap:10px}
       .mapping-step{display:grid;gap:14px}.mapping-intro{align-items:flex-start}.mapping-intro h3{margin:0 0 6px}.selection-summary{padding:10px 12px;background:var(--secondary-background-color,#f5f5f5);border-radius:8px}.tree{display:grid;gap:10px}.tree-node{border:1px solid var(--border);border-radius:10px;background:var(--surface);overflow:hidden}.leaf-select{display:flex;gap:10px;padding:13px 14px;align-items:flex-start}.leaf-select input{width:auto;margin-top:3px}.leaf-select span,.container-title span{display:grid;gap:3px}.selected-node{border-color:color-mix(in srgb,var(--accent) 55%,var(--border))}.container-head{display:flex;align-items:center;gap:6px;padding:8px}.expand{border:0;padding:7px;background:transparent;font-size:18px}.container-title{border:0;background:transparent;padding:5px;text-align:left;flex:1;display:flex}.children{display:grid;gap:8px;padding:0 10px 10px 32px}.children .tree-node{background:var(--secondary-background-color,#fafafa)}.empty-child{padding:12px;color:var(--muted)}.technical{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.mapping-editor{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding:14px;border-top:1px solid var(--border);background:color-mix(in srgb,var(--accent) 4%,var(--surface))}.mapping-editor .check,.mapping-editor .info-box,.mapping-editor>small{grid-column:1/-1}.structured-editor{grid-template-columns:1fr}.info-box{display:grid;gap:4px;padding:11px 13px;background:var(--secondary-background-color,#f5f5f5);border-radius:8px}.advanced{border:1px dashed var(--border);border-radius:10px;padding:12px}.advanced summary{cursor:pointer;font-weight:600}.advanced-body{padding-top:12px;display:grid;gap:12px}.advanced-body p{margin:0;color:var(--muted)}
-      .builder{margin-top:10px;border:1px solid var(--border);border-radius:10px;overflow:hidden}.builder-toggle{width:100%;border:0;border-radius:0;padding:14px;text-align:left;display:flex;align-items:center;justify-content:space-between}.builder-toggle span:first-child{display:grid;gap:3px}.builder-content{padding:16px;display:grid;gap:14px}.builder-content p{margin:0;color:var(--muted)}.segmented,.code-tabs{display:flex;gap:4px;flex-wrap:wrap}.segmented button,.code-tabs button{border-radius:999px;padding:7px 11px}.segmented button.active,.code-tabs button.active{background:var(--accent);color:#fff;border-color:var(--accent)}.builder-labels,.builder-row{display:grid;grid-template-columns:1.1fr .7fr 1.1fr 38px;gap:8px;align-items:center}.builder-labels{font-size:12px;color:var(--muted);padding:0 2px}.icon-button{padding:8px;font-size:18px}.add-value{justify-self:start}.builder-generate{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.request-preview{background:var(--secondary-background-color,#f5f5f5);border-radius:8px;padding:10px}.request-preview pre{margin:6px 0 0;max-height:220px;overflow:auto}.builder-content h4{margin:4px 0 0}.code-box{position:relative;background:#111;color:#f5f5f5;border-radius:9px;padding:14px}.code-box pre{margin:0;padding-right:100px;max-height:320px;overflow:auto}.code-box button{position:absolute;top:10px;right:10px;background:#222;color:#fff;border-color:#444}.code-placeholder{padding:16px;border:1px dashed var(--border);border-radius:8px;color:var(--muted)}
+      .builder{margin-top:10px;border:1px solid var(--border);border-radius:10px;overflow:hidden}.builder-toggle{width:100%;border:0;border-radius:0;padding:14px;text-align:left;display:flex;align-items:center;justify-content:space-between}.builder-toggle span:first-child{display:grid;gap:3px}.builder-content{padding:16px;display:grid;gap:14px}.builder-content p{margin:0;color:var(--muted)}.segmented,.code-tabs{display:flex;gap:4px;flex-wrap:wrap}.segmented button,.code-tabs button{border-radius:999px;padding:7px 11px}.segmented button.active,.code-tabs button.active{background:var(--accent);color:#fff;border-color:var(--accent)}.builder-labels,.builder-row{display:grid;grid-template-columns:1.1fr .7fr 1.1fr 38px;gap:8px;align-items:center}.builder-labels{font-size:12px;color:var(--muted);padding:0 2px}.icon-button{padding:8px;font-size:18px}.builder-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.request-preview{background:var(--secondary-background-color,#f5f5f5);border-radius:8px;padding:10px}.request-preview pre{margin:6px 0 0;max-height:220px;overflow:auto}.builder-content h4{margin:4px 0 0}.code-box{position:relative;background:#111;color:#f5f5f5;border-radius:9px;padding:14px}.code-box pre{margin:0;padding-right:100px;max-height:320px;overflow:auto}.code-box button{position:absolute;top:10px;right:10px;background:#222;color:#fff;border-color:#444}.code-placeholder{padding:16px;border:1px dashed var(--border);border-radius:8px;color:var(--muted)}
       @media(max-width:700px){.page{padding:14px}.page-head,.row,.mapping-intro,.secondary-row{align-items:stretch;flex-direction:column}.actions{width:100%}.stats{grid-template-columns:1fr}.url{display:grid;grid-template-columns:1fr auto}.url input{grid-column:1/-1}.modal{max-height:calc(100vh - 16px)}.overlay{padding:8px}.modal-body{padding:14px}.mapping-editor{grid-template-columns:1fr}.mapping-editor>*{grid-column:1}.container-head{align-items:flex-start;flex-wrap:wrap}.container-title{min-width:70%}.container-head>.secondary{margin-left:35px}.children{padding-left:14px}.builder-labels{display:none}.builder-row{grid-template-columns:1fr 1fr 38px}.builder-row>input:first-child{grid-column:1/-1}.builder-row>select{grid-column:1}.builder-row>input:not(:first-child),.builder-row>select+select{grid-column:2}.builder-row>.icon-button{grid-column:3;grid-row:2}.code-box pre{padding-right:0;padding-top:42px}}
     </style>`;
   }
