@@ -1,6 +1,12 @@
 {
   "title": "HTTP Data Bridge",
   "config": {
+    "step": {
+      "user": {
+        "title": "Set up HTTP Data Bridge",
+        "description": "Create HTTP Data Bridge. You will configure the first push source next."
+      }
+    },
     "abort": {
       "single_instance_allowed": "HTTP Data Bridge is already configured. Add another source from the existing integration entry."
     }
