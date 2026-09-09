@@ -11,7 +11,11 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+)
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
@@ -27,6 +31,7 @@ from .const import (
 from .data import HttpDataBridgeManager, async_remove_storage
 from .webhooks import async_delete_cloudhook
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 PLATFORMS = (Platform.SENSOR, Platform.BINARY_SENSOR)
 _MIGRATION_REMOVALS = "migration_removals"
 
