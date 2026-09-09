@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+import logging
 from typing import Any
 
 from aiohttp.web import Request, Response
@@ -37,6 +38,8 @@ from .webhooks import (
     async_resolve_webhook_url,
 )
 
+_LOGGER = logging.getLogger(__name__)
+
 UpdateListener = Callable[[], None]
 
 
@@ -59,42 +62,66 @@ class HttpDataBridgeManager:
         self.sources: dict[str, HttpDataBridgeRuntime] = {}
 
     async def async_setup(self) -> None:
-        """Load source state, resolve cloudhooks, and register webhooks."""
-        for subentry in tuple(self.entry.subentries.values()):
-            if subentry.subentry_type != SUBENTRY_TYPE_SOURCE:
-                continue
+        """Load source state, resolve cloudhooks, and register webhooks transactionally."""
+        try:
+            for subentry in tuple(self.entry.subentries.values()):
+                if subentry.subentry_type != SUBENTRY_TYPE_SOURCE:
+                    continue
 
-            runtime = HttpDataBridgeRuntime(self.hass, self.entry, subentry)
-            await runtime.async_load()
-            self.sources[subentry.subentry_id] = runtime
+                runtime = HttpDataBridgeRuntime(self.hass, self.entry, subentry)
+                await runtime.async_load()
+                self.sources[subentry.subentry_id] = runtime
 
-            if not runtime.enabled:
-                continue
+                source_data = dict(subentry.data)
+                # A failed remote->local cloudhook deletion is intentionally kept
+                # as a cleanup marker in source data. Local-only enforcement does
+                # not use this URL; retry cleanup at every setup until Cloud is
+                # reachable (or reports the hook already absent), then forget it.
+                if runtime.local_only and source_data.get(CONF_CLOUDHOOK_URL):
+                    if await async_delete_cloudhook(self.hass, runtime.webhook_id):
+                        source_data.pop(CONF_CLOUDHOOK_URL, None)
+                        runtime.cloudhook_url = None
+                        self.hass.config_entries.async_update_subentry(
+                            self.entry,
+                            subentry,
+                            data=source_data,
+                        )
 
-            source_data = dict(subentry.data)
-            _, cloudhook_url, created = await async_resolve_webhook_url(
-                self.hass, source_data
-            )
-            if cloudhook_url:
-                runtime.cloudhook_url = cloudhook_url
-                if created or source_data.get(CONF_CLOUDHOOK_URL) != cloudhook_url:
-                    source_data[CONF_CLOUDHOOK_URL] = cloudhook_url
-                    self.hass.config_entries.async_update_subentry(
-                        self.entry,
-                        subentry,
-                        data=source_data,
-                    )
+                if not runtime.enabled:
+                    continue
 
-            webhook.async_register(
-                self.hass,
-                DOMAIN,
-                subentry.title,
-                runtime.webhook_id,
-                self._handler_for(runtime),
-                local_only=runtime.local_only,
-                allowed_methods={"POST"},
-            )
-            runtime.webhook_registered = True
+                _, cloudhook_url, created = await async_resolve_webhook_url(
+                    self.hass, source_data
+                )
+                if cloudhook_url:
+                    runtime.cloudhook_url = cloudhook_url
+                    if created or source_data.get(CONF_CLOUDHOOK_URL) != cloudhook_url:
+                        source_data[CONF_CLOUDHOOK_URL] = cloudhook_url
+                        self.hass.config_entries.async_update_subentry(
+                            self.entry,
+                            subentry,
+                            data=source_data,
+                        )
+
+                webhook.async_register(
+                    self.hass,
+                    DOMAIN,
+                    subentry.title,
+                    runtime.webhook_id,
+                    self._handler_for(runtime),
+                    local_only=runtime.local_only,
+                    allowed_methods={"POST"},
+                )
+                runtime.webhook_registered = True
+        except Exception:
+            # A later source must not leave earlier webhooks/listeners/storage
+            # runtimes active when the parent entry fails setup. Otherwise a
+            # retry can immediately fail on duplicate webhook registration.
+            try:
+                await self.async_shutdown()
+            except Exception:  # pragma: no cover - defensive cleanup logging
+                _LOGGER.exception("Error rolling back partial HTTP Data Bridge setup")
+            raise
 
     def _handler_for(self, runtime: HttpDataBridgeRuntime):
         """Build the Home Assistant webhook handler for one source."""
@@ -107,7 +134,7 @@ class HttpDataBridgeManager:
         return _handle_webhook
 
     async def async_shutdown(self) -> None:
-        """Unload all source runtimes and clean sources removed/restricted by update."""
+        """Unload all source runtimes and clean sources removed by an update."""
         current_by_source_id = {
             str(subentry.data.get(CONF_SOURCE_ID, "")): subentry
             for subentry in self.entry.subentries.values()
@@ -126,13 +153,6 @@ class HttpDataBridgeManager:
                 if runtime.cloudhook_url or not runtime.local_only:
                     await async_delete_cloudhook(self.hass, runtime.webhook_id)
                 await async_remove_storage(self.hass, runtime.source_id)
-                continue
-
-            # A reconfigure may switch a remotely reachable source to local-only.
-            # Ensure an old cloudhook is removed even if the config-flow cleanup
-            # could not reach Home Assistant Cloud at save time.
-            if bool(current.data.get(CONF_LOCAL_ONLY, False)) and runtime.cloudhook_url:
-                await async_delete_cloudhook(self.hass, runtime.webhook_id)
 
 
 class HttpDataBridgeRuntime:

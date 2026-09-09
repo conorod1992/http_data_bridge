@@ -6,7 +6,7 @@ from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory, MAX_LENGTH_STATE_STATE
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -22,7 +22,7 @@ from .const import (
 )
 from .data import HttpDataBridgeManager, HttpDataBridgeRuntime
 from .entity import HttpDataBridgeEntity
-from .helpers import normalise_sensor_value
+from .helpers import mapping_value_is_available, normalise_sensor_value
 
 
 async def async_setup_entry(
@@ -63,7 +63,6 @@ class HttpDataBridgeSensor(HttpDataBridgeEntity, SensorEntity):
         super().__init__(runtime, field)
         self._store_in_attribute = bool(field.get(FIELD_STORE_IN_ATTRIBUTE, False))
         unit = field.get(FIELD_UNIT)
-        self._requires_number = bool(unit)
 
         if self._store_in_attribute:
             self._attr_device_class = SensorDeviceClass.TIMESTAMP
@@ -75,27 +74,10 @@ class HttpDataBridgeSensor(HttpDataBridgeEntity, SensorEntity):
         """Return whether a fresh HA-compatible value is present."""
         if not super().available:
             return False
-
-        if self._store_in_attribute:
-            return True
-
         try:
-            raw_value = self._value()
+            return mapping_value_is_available(self._field, self._value())
         except KeyError:
             return False
-
-        if isinstance(raw_value, (dict, list)):
-            return False
-
-        if self._requires_number and not (
-            isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool)
-        ):
-            return False
-
-        value = normalise_sensor_value(raw_value)
-        if value is not None and len(str(value)) > MAX_LENGTH_STATE_STATE:
-            return False
-        return True
 
     @property
     def native_value(self):

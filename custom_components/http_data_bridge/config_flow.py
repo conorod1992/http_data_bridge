@@ -159,6 +159,17 @@ def _storage_guidance(value: JsonValue) -> str:
     )
 
 
+async def _async_cleanup_previous_cloudhook(
+    hass: HomeAssistant,
+    data: dict[str, Any],
+    webhook_id: str,
+    cloudhook_url: str,
+) -> None:
+    """Delete an obsolete cloudhook or retain a durable retry marker."""
+    if not await async_delete_cloudhook(hass, webhook_id):
+        data[CONF_CLOUDHOOK_URL] = cloudhook_url
+
+
 class HttpDataBridgeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Create the single HTTP Data Bridge parent entry."""
 
@@ -721,10 +732,18 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
             old_subentry = self._get_reconfigure_subentry()
             self._cleanup_removed_entities(old_subentry, self._field_configs)
 
-            if self._local_only and old_subentry.data.get(CONF_CLOUDHOOK_URL):
-                # The saved source becomes local-only immediately even when cloud
-                # cleanup cannot be completed right now. Runtime unload also retries.
-                await async_delete_cloudhook(self.hass, self._webhook_id)
+            if self._local_only and (
+                old_cloudhook := old_subentry.data.get(CONF_CLOUDHOOK_URL)
+            ):
+                # Stop relying on the cloudhook immediately. If Home Assistant
+                # Cloud is temporarily unavailable, retain the URL only as a
+                # durable cleanup marker so manager setup can retry later.
+                await _async_cleanup_previous_cloudhook(
+                    self.hass,
+                    data,
+                    self._webhook_id,
+                    str(old_cloudhook),
+                )
 
             self._committed = True
             return self.async_update_and_abort(

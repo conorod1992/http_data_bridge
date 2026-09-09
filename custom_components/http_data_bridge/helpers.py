@@ -8,6 +8,16 @@ import math
 import re
 from typing import Any
 
+from homeassistant.const import MAX_LENGTH_STATE_STATE
+
+from .const import (
+    FIELD_PLATFORM,
+    FIELD_STORE_IN_ATTRIBUTE,
+    FIELD_UNIT,
+    PLATFORM_BINARY_SENSOR,
+    PLATFORM_SENSOR,
+)
+
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 _CANONICAL_ARRAY_INDEX = re.compile(r"0|[1-9][0-9]*")
@@ -177,3 +187,28 @@ def normalise_sensor_value(value: JsonValue) -> str | int | float | None:
     if isinstance(value, (str, int, float)):
         return value
     return None
+
+
+def mapping_value_is_available(field: dict[str, Any], value: JsonValue) -> bool:
+    """Return whether a mapped JSON value can be represented by its HA entity."""
+    platform = str(field.get(FIELD_PLATFORM, ""))
+
+    if platform == PLATFORM_BINARY_SENSOR:
+        return isinstance(value, bool)
+
+    if platform != PLATFORM_SENSOR:
+        return False
+
+    if bool(field.get(FIELD_STORE_IN_ATTRIBUTE, False)):
+        return True
+
+    if isinstance(value, (dict, list)):
+        return False
+
+    if field.get(FIELD_UNIT) and not (
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+    ):
+        return False
+
+    normalised = normalise_sensor_value(value)
+    return normalised is None or len(str(normalised)) <= MAX_LENGTH_STATE_STATE

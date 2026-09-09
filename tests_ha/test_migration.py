@@ -129,10 +129,10 @@ async def test_multiple_v1_entries_consolidate_without_changing_source_identity(
     await runtime.async_shutdown()
 
 
-async def test_disabled_legacy_entry_becomes_disabled_source(
+async def test_disabled_legacy_entry_becomes_reenableable_disabled_source(
     hass: HomeAssistant,
 ) -> None:
-    """Consolidation must not silently activate a previously disabled source."""
+    """Legacy config-entry disables must not become sticky user registry disables."""
     enabled = MockConfigEntry(
         domain=DOMAIN,
         title="Enabled",
@@ -151,6 +151,23 @@ async def test_disabled_legacy_entry_becomes_disabled_source(
     enabled.add_to_hass(hass)
     disabled.add_to_hass(hass)
 
+    entity_registry = er.async_get(hass)
+    disabled_entity = entity_registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        "disabled-source:/value",
+        config_entry=disabled,
+        suggested_object_id="disabled_value",
+        disabled_by=er.RegistryEntryDisabler.CONFIG_ENTRY,
+    )
+    device_registry = dr.async_get(hass)
+    disabled_device = device_registry.async_get_or_create(
+        config_entry_id=disabled.entry_id,
+        identifiers={(DOMAIN, disabled.entry_id)},
+        name="Disabled",
+        disabled_by=dr.DeviceEntryDisabler.CONFIG_ENTRY,
+    )
+
     await async_migrate_integration(hass)
     parent = hass.config_entries.async_entries(DOMAIN)[0]
     by_source_id = {
@@ -159,3 +176,15 @@ async def test_disabled_legacy_entry_becomes_disabled_source(
     }
     assert by_source_id["enabled-source"].data[CONF_ENABLED] is True
     assert by_source_id["disabled-source"].data[CONF_ENABLED] is False
+
+    moved_entity = entity_registry.async_get(disabled_entity.entity_id)
+    assert moved_entity is not None
+    assert moved_entity.config_entry_id == parent.entry_id
+    assert moved_entity.config_subentry_id == by_source_id["disabled-source"].subentry_id
+    assert moved_entity.disabled_by is None
+
+    moved_device = device_registry.async_get(disabled_device.id)
+    assert moved_device is not None
+    assert moved_device.config_entry_id == parent.entry_id
+    assert moved_device.config_subentry_id == by_source_id["disabled-source"].subentry_id
+    assert moved_device.disabled_by is None

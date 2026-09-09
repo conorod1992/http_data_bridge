@@ -30,7 +30,7 @@ from .const import (
     SUBENTRY_TYPE_SOURCE,
 )
 from .data import HttpDataBridgeManager, HttpDataBridgeRuntime
-from .helpers import pointer_to_label
+from .helpers import mapping_value_is_available, pointer_to_label
 from .webhooks import async_resolve_webhook_url
 
 _BACKEND_REGISTERED = "frontend_backend_registered"
@@ -149,7 +149,12 @@ async def _source_snapshot(
         path = str(field[FIELD_PATH])
         value_present = runtime is not None and path in runtime.values
         attribute_backed = bool(field.get(FIELD_STORE_IN_ATTRIBUTE, False))
-        field_available = bool(runtime and runtime.available and value_present)
+        field_available = bool(
+            runtime
+            and runtime.available
+            and value_present
+            and mapping_value_is_available(field, runtime.values[path])
+        )
         fields.append(
             {
                 "name": str(field[FIELD_NAME]),
@@ -255,12 +260,16 @@ async def websocket_attribute_value(
         connection.send_error(msg["id"], "not_found", "Push source not found")
         return
 
-    mapping_exists = any(
-        str(field.get(FIELD_PATH, "")) == path
-        and bool(field.get(FIELD_STORE_IN_ATTRIBUTE, False))
-        for field in subentry.data.get(CONF_FIELDS, [])
+    mapping = next(
+        (
+            field
+            for field in subentry.data.get(CONF_FIELDS, [])
+            if str(field.get(FIELD_PATH, "")) == path
+            and bool(field.get(FIELD_STORE_IN_ATTRIBUTE, False))
+        ),
+        None,
     )
-    if not mapping_exists:
+    if mapping is None:
         connection.send_error(msg["id"], "not_found", "Attribute-backed mapping not found")
         return
 
@@ -270,7 +279,12 @@ async def websocket_attribute_value(
         if isinstance(manager, HttpDataBridgeManager)
         else None
     )
-    if runtime is None or not runtime.available or path not in runtime.values:
+    if (
+        runtime is None
+        or not runtime.available
+        or path not in runtime.values
+        or not mapping_value_is_available(mapping, runtime.values[path])
+    ):
         connection.send_result(msg["id"], {"available": False, "value": None})
         return
 
