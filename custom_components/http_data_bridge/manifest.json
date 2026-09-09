@@ -2,16 +2,15 @@
   "domain": "http_data_bridge",
   "name": "HTTP Data Bridge",
   "after_dependencies": [
-    "cloud"
+    "cloud",
+    "frontend"
   ],
   "codeowners": [
     "@conorod1992"
   ],
   "config_flow": true,
   "dependencies": [
-    "frontend",
     "http",
-    "panel_custom",
     "webhook",
     "websocket_api"
   ],
