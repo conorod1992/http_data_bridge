@@ -113,15 +113,24 @@ async def async_delete_cloudhook(hass: HomeAssistant, webhook_id: str) -> bool:
     return True
 
 
-async def async_read_json_payload(request: Request) -> JsonValue:
-    """Read and strictly validate a bounded JSON webhook body."""
-    if request.content_length is not None and request.content_length > MAX_PAYLOAD_BYTES:
+async def async_read_json_payload(request: Any) -> JsonValue:
+    """Read and strictly validate a bounded JSON webhook body.
+
+    Home Assistant Cloud forwards cloudhooks through ``MockRequest`` rather than
+    a normal aiohttp ``Request``. ``MockRequest`` intentionally lacks both
+    ``content_length`` and ``iter_chunked()``, but its body stream supports
+    ``read(size)``. Reading through that common interface keeps the same 256 KiB
+    limit for local webhooks and Nabu Casa cloudhooks.
+    """
+    content_length = getattr(request, "content_length", None)
+    if content_length is not None and content_length > MAX_PAYLOAD_BYTES:
         raise PayloadValidationError(
             "payload_too_large", HTTPStatus.REQUEST_ENTITY_TOO_LARGE
         )
 
     raw = bytearray()
-    async for chunk in request.content.iter_chunked(64 * 1024):
+    content = request.content
+    while chunk := await content.read(64 * 1024):
         raw.extend(chunk)
         if len(raw) > MAX_PAYLOAD_BYTES:
             raise PayloadValidationError(
