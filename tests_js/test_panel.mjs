@@ -69,6 +69,19 @@ const containerMapping = panel._defaultMap(byPath.get("/details"));
 assert.equal(containerMapping.platform, "sensor");
 assert.equal(containerMapping.store_in_attribute, true);
 
+const blankBuilder = panel._newBuilder("https://example.test/webhook");
+blankBuilder.open = true;
+const beforeGenerateHtml = panel._builderHtml(blankBuilder);
+assert.match(beforeGenerateHtml, />Generate</);
+assert.doesNotMatch(beforeGenerateHtml, /Give every example value a name/);
+assert.doesNotMatch(beforeGenerateHtml, /Ready-to-use code/);
+assert.doesNotMatch(beforeGenerateHtml, /JSON request preview/);
+
+assert.equal(panel._generateBuilder(blankBuilder), false);
+assert.equal(blankBuilder.generated, false);
+assert.equal(blankBuilder.generationError, "Give every example value a name.");
+assert.match(panel._builderHtml(blankBuilder), /Give every example value a name/);
+
 const builder = panel._newBuilder("https://example.test/webhook");
 builder.rows = [
   { id: "1", name: "temperature", type: "number", value: "21.5" },
@@ -79,6 +92,20 @@ assert.deepEqual(panel._builderPayload(builder), {
   value: { temperature: 21.5, online: true, status: "running" },
   error: "",
 });
+assert.equal(builder.generated, false);
+assert.equal(panel._builderCode(builder).error, "Generate the request first.");
+
+assert.equal(panel._generateBuilder(builder), true);
+assert.equal(builder.generated, true);
+assert.deepEqual(builder.generatedValue, {
+  temperature: 21.5,
+  online: true,
+  status: "running",
+});
+const generatedHtml = panel._builderHtml(builder);
+assert.match(generatedHtml, /JSON request preview/);
+assert.match(generatedHtml, /Ready-to-use code/);
+assert.match(generatedHtml, /Generate again/);
 
 const codeExpectations = {
   powershell: "Invoke-RestMethod",
@@ -96,14 +123,32 @@ for (const [tab, expected] of Object.entries(codeExpectations)) {
   assert.ok(generated.code.includes(expected), `${tab} should contain ${expected}`);
 }
 
+builder.rows[0].value = "23.0";
+panel._invalidateBuilder(builder);
+assert.equal(builder.generated, false);
+assert.equal(builder.generatedValue, null);
+assert.equal(builder.generationError, "");
+assert.doesNotMatch(panel._builderHtml(builder), /Ready-to-use code/);
+assert.equal(panel._builderCode(builder).error, "Generate the request first.");
+
 builder.mode = "json";
 builder.json = '{"nested":{"value":42},"items":[1,2]}';
 assert.deepEqual(panel._builderPayload(builder), {
   value: { nested: { value: 42 }, items: [1, 2] },
   error: "",
 });
+assert.equal(panel._generateBuilder(builder), true);
+assert.deepEqual(builder.generatedValue, {
+  nested: { value: 42 },
+  items: [1, 2],
+});
 
 builder.json = "{invalid";
-assert.equal(panel._builderPayload(builder).error, "Enter valid JSON to generate code.");
+panel._invalidateBuilder(builder);
+assert.equal(builder.generationError, "");
+assert.doesNotMatch(panel._builderHtml(builder), /Enter valid JSON to generate code/);
+assert.equal(panel._generateBuilder(builder), false);
+assert.equal(builder.generationError, "Enter valid JSON to generate code.");
+assert.match(panel._builderHtml(builder), /Enter valid JSON to generate code/);
 
 console.log("HTTP Data Bridge panel helper tests passed");
