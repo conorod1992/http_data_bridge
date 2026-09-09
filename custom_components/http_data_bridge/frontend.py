@@ -10,7 +10,7 @@ import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 
 from .const import (
     CONF_ENABLED,
@@ -38,7 +38,7 @@ _PANEL_FILE = "http-data-bridge-panel.js"
 
 
 async def async_register_frontend(hass: HomeAssistant) -> None:
-    """Register the management API and, when available, the sidebar panel."""
+    """Register the management API and, when configured, the sidebar panel."""
     domain_data = hass.data.setdefault(DOMAIN, {})
 
     if not domain_data.get(_BACKEND_REGISTERED):
@@ -55,6 +55,12 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
             ]
         )
         domain_data[_BACKEND_REGISTERED] = True
+
+    # Do not leave a sidebar item behind merely because the integration module
+    # was loaded to show its config flow. async_setup_entry calls this again once
+    # the first parent entry actually exists.
+    if not hass.config_entries.async_entries(DOMAIN):
+        return
 
     # The sidebar is an optional presentation layer. Normal Home Assistant
     # installations have frontend loaded, while headless/test installations may
@@ -77,6 +83,23 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
         config_panel_domain=DOMAIN,
     )
     domain_data[_PANEL_REGISTERED] = True
+
+
+@callback
+def async_remove_frontend_panel(hass: HomeAssistant) -> None:
+    """Remove the sidebar panel when the single parent entry is deleted."""
+    domain_data = hass.data.get(DOMAIN)
+    if (
+        not domain_data
+        or not domain_data.get(_PANEL_REGISTERED)
+        or "frontend" not in hass.config.components
+    ):
+        return
+
+    from homeassistant.components import frontend  # noqa: PLC0415
+
+    frontend.async_remove_panel(hass, PANEL_URL_PATH, warn_if_unknown=False)
+    domain_data[_PANEL_REGISTERED] = False
 
 
 async def _source_snapshot(
