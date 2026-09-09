@@ -8,12 +8,24 @@ from typing import Any
 
 from aiohttp.web import Request, Response, json_response
 
-from homeassistant.components import cloud, webhook
+from homeassistant.components import webhook
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.network import NoURLAvailableError
 
 from .const import CONF_CLOUDHOOK_URL, CONF_LOCAL_ONLY, CONF_WEBHOOK_ID, MAX_PAYLOAD_BYTES
 from .helpers import JsonValue, parse_json
+
+
+def _get_cloud_component() -> Any:
+    """Return Home Assistant Cloud without importing it during integration import.
+
+    Home Assistant Cloud pulls in a broad optional dependency graph. HTTP Data
+    Bridge only needs it when Cloud is already loaded and a source can use a
+    cloudhook, so keep that import behind the runtime availability check.
+    """
+    from homeassistant.components import cloud  # noqa: PLC0415
+
+    return cloud
 
 
 async def async_resolve_webhook_url(
@@ -35,10 +47,12 @@ async def async_resolve_webhook_url(
     if local_only:
         return _generate_ha_url(hass, webhook_id, local_only=True), None, False
 
+    if "cloud" not in hass.config.components:
+        return _generate_ha_url(hass, webhook_id, local_only=False), None, False
+
+    cloud = _get_cloud_component()
+    cloud_available = cloud.async_active_subscription(hass)
     stored_cloudhook = source_data.get(CONF_CLOUDHOOK_URL)
-    cloud_available = (
-        "cloud" in hass.config.components and cloud.async_active_subscription(hass)
-    )
 
     if cloud_available and isinstance(stored_cloudhook, str) and stored_cloudhook:
         return stored_cloudhook, stored_cloudhook, False
@@ -73,6 +87,8 @@ async def async_delete_cloudhook(hass: HomeAssistant, webhook_id: str) -> bool:
     """Best-effort deletion of a Home Assistant Cloud cloudhook."""
     if "cloud" not in hass.config.components:
         return False
+
+    cloud = _get_cloud_component()
     try:
         await cloud.async_delete_cloudhook(hass, webhook_id)
     except (cloud.CloudNotAvailable, ValueError):
