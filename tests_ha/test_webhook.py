@@ -9,15 +9,19 @@ from aiohttp.test_utils import TestClient
 from homeassistant.const import MAX_LENGTH_STATE_STATE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
 
 from custom_components.http_data_bridge.const import (
+    ATTR_VALUE,
     DOMAIN,
     FIELD_NAME,
     FIELD_PATH,
     FIELD_PLATFORM,
+    FIELD_STORE_IN_ATTRIBUTE,
     MAX_PAYLOAD_BYTES,
     PLATFORM_SENSOR,
 )
+from custom_components.http_data_bridge.sensor import HttpDataBridgeSensor
 
 
 async def _setup_source(hass: HomeAssistant, entry_factory, **entry_kwargs):
@@ -40,7 +44,7 @@ async def test_webhook_updates_native_entities_and_snapshot_availability(
     entry_factory,
 ) -> None:
     """A POST should update selected entities and missing fields go unavailable."""
-    entry = await _setup_source(hass, entry_factory)
+    await _setup_source(hass, entry_factory)
     client: TestClient = await hass_client()
     path = "/api/webhook/test-http-data-bridge-webhook"
 
@@ -63,6 +67,76 @@ async def test_webhook_updates_native_entities_and_snapshot_availability(
     await hass.async_block_till_done()
     assert hass.states.get(temperature_id).state == "unavailable"
     assert hass.states.get(online_id).state == "off"
+
+
+async def test_attribute_backed_sensor_exposes_structured_value_with_timestamp_state(
+    hass: HomeAssistant,
+    hass_client,
+    entry_factory,
+) -> None:
+    """Structured JSON should live in an unrecorded sensor attribute."""
+    fields = [
+        {
+            FIELD_PATH: "",
+            FIELD_NAME: "Payload",
+            FIELD_PLATFORM: PLATFORM_SENSOR,
+            FIELD_STORE_IN_ATTRIBUTE: True,
+        }
+    ]
+    await _setup_source(hass, entry_factory, fields=fields)
+    client: TestClient = await hass_client()
+    entity_id = _entity_id(hass, "sensor", "test-source-id", "")
+    payload = {
+        "status": "running",
+        "message": "x" * 400,
+        "items": [{"id": 1, "name": "Example"}],
+    }
+
+    response = await client.post(
+        "/api/webhook/test-http-data-bridge-webhook", json=payload
+    )
+    assert response.status == HTTPStatus.OK
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert dt_util.parse_datetime(state.state) is not None
+    assert state.attributes[ATTR_VALUE] == payload
+    assert ATTR_VALUE in HttpDataBridgeSensor._unrecorded_attributes
+
+
+async def test_attribute_backed_sensor_missing_path_becomes_unavailable(
+    hass: HomeAssistant,
+    hass_client,
+    entry_factory,
+) -> None:
+    """Attribute-backed mappings keep the normal snapshot/missing-path semantics."""
+    fields = [
+        {
+            FIELD_PATH: "/details",
+            FIELD_NAME: "Details",
+            FIELD_PLATFORM: PLATFORM_SENSOR,
+            FIELD_STORE_IN_ATTRIBUTE: True,
+        }
+    ]
+    await _setup_source(hass, entry_factory, fields=fields)
+    client: TestClient = await hass_client()
+    entity_id = _entity_id(hass, "sensor", "test-source-id", "/details")
+
+    response = await client.post(
+        "/api/webhook/test-http-data-bridge-webhook",
+        json={"details": {"a": 1}},
+    )
+    assert response.status == HTTPStatus.OK
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).attributes[ATTR_VALUE] == {"a": 1}
+
+    response = await client.post(
+        "/api/webhook/test-http-data-bridge-webhook", json={"other": 2}
+    )
+    assert response.status == HTTPStatus.OK
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).state == "unavailable"
 
 
 async def test_entities_are_owned_by_source_subentry(
@@ -103,7 +177,7 @@ async def test_oversized_rendered_sensor_value_becomes_unavailable(
     hass_client,
     entry_factory,
 ) -> None:
-    """Scalars beyond Home Assistant's state limit should fail safely."""
+    """Scalars beyond Home Assistant's state limit should fail safely without attribute mode."""
     fields = [
         {
             FIELD_PATH: "/message",
