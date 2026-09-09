@@ -26,6 +26,7 @@ from custom_components.http_data_bridge.const import (
     FIELD_NAME,
     FIELD_PATH,
     FIELD_PLATFORM,
+    FIELD_STORE_IN_ATTRIBUTE,
     FIELD_UNIT,
     PARENT_TITLE,
     PLATFORM_BINARY_SENSOR,
@@ -83,6 +84,28 @@ async def _enter_pasted_sample(
     )
 
 
+async def _configure_normal_sensor(
+    hass: HomeAssistant,
+    result: dict,
+    *,
+    name: str,
+    unit: str = "",
+) -> dict:
+    """Configure the current value as a normal state-backed sensor."""
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={FIELD_NAME: name, FIELD_PLATFORM: PLATFORM_SENSOR},
+    )
+    assert result["step_id"] == "configure_sensor"
+    return await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            FIELD_STORE_IN_ATTRIBUTE: False,
+            **({FIELD_UNIT: unit} if unit else {}),
+        },
+    )
+
+
 async def test_parent_flow_creates_single_parent_and_chains_source_flow(
     hass: HomeAssistant,
 ) -> None:
@@ -134,13 +157,8 @@ async def test_pasted_sample_creates_native_mapping_subentry(
         )
         assert result["step_id"] == "configure_field"
 
-        result = await hass.config_entries.subentries.async_configure(
-            result["flow_id"],
-            user_input={
-                FIELD_NAME: "Temperature",
-                FIELD_PLATFORM: PLATFORM_SENSOR,
-                FIELD_UNIT: "°C",
-            },
+        result = await _configure_normal_sensor(
+            hass, result, name="Temperature", unit="°C"
         )
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"],
@@ -175,6 +193,104 @@ async def test_pasted_sample_creates_native_mapping_subentry(
             FIELD_PLATFORM: PLATFORM_BINARY_SENSOR,
         },
     ]
+
+
+async def test_structured_root_can_be_stored_in_sensor_attribute(
+    hass: HomeAssistant,
+    entry_factory,
+) -> None:
+    """The complete JSON payload should be selectable as an attribute-backed sensor."""
+    parent = entry_factory()
+    hass.config_entries.async_remove_subentry(parent, "test-source-subentry")
+
+    with (
+        patch(
+            "custom_components.http_data_bridge.config_flow.webhook.async_generate_id",
+            return_value="attribute-webhook-id",
+        ),
+        patch(
+            "custom_components.http_data_bridge.config_flow.async_resolve_webhook_url",
+            new_callable=AsyncMock,
+            return_value=("http://ha.local/api/webhook/attribute-webhook-id", None, False),
+        ),
+    ):
+        result = await _enter_pasted_sample(
+            hass,
+            parent,
+            payload='{"status":"running","items":[{"id":1}]}',
+            local_only=True,
+        )
+        assert result["step_id"] == "select_fields"
+        option_values = {
+            option["value"]
+            for option in result["data_schema"].schema[CONF_FIELDS].config["options"]
+        }
+        assert "" in option_values
+        assert "/items" in option_values
+
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={CONF_FIELDS: [""]}
+        )
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"],
+            user_input={FIELD_NAME: "Full payload", FIELD_PLATFORM: PLATFORM_SENSOR},
+        )
+        assert result["step_id"] == "configure_sensor"
+
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={FIELD_STORE_IN_ATTRIBUTE: False}
+        )
+        assert result["step_id"] == "configure_sensor"
+        assert result["errors"][FIELD_STORE_IN_ATTRIBUTE] == "attribute_required"
+
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={FIELD_STORE_IN_ATTRIBUTE: True}
+        )
+        assert result["step_id"] == "confirm"
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={}
+        )
+
+    source = next(iter(parent.subentries.values()))
+    assert source.data[CONF_FIELDS] == [
+        {
+            FIELD_PATH: "",
+            FIELD_NAME: "Full payload",
+            FIELD_PLATFORM: PLATFORM_SENSOR,
+            FIELD_STORE_IN_ATTRIBUTE: True,
+        }
+    ]
+
+
+async def test_long_string_requires_attribute_storage(
+    hass: HomeAssistant,
+    entry_factory,
+) -> None:
+    """A sample already beyond HA's state limit should default to attribute storage."""
+    parent = entry_factory()
+    hass.config_entries.async_remove_subentry(parent, "test-source-subentry")
+    long_value = "x" * 300
+
+    result = await _enter_pasted_sample(
+        hass,
+        parent,
+        payload='{"message":"' + long_value + '"}',
+        local_only=True,
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], user_input={CONF_FIELDS: ["/message"]}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={FIELD_NAME: "Message", FIELD_PLATFORM: PLATFORM_SENSOR},
+    )
+    assert result["step_id"] == "configure_sensor"
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], user_input={FIELD_STORE_IN_ATTRIBUTE: False}
+    )
+    assert result["errors"][FIELD_STORE_IN_ATTRIBUTE] == "attribute_required"
+    hass.config_entries.subentries.async_abort(result["flow_id"])
 
 
 async def test_live_capture_uses_temporary_webhook_then_same_mapping_flow(
@@ -216,7 +332,7 @@ async def test_live_capture_uses_temporary_webhook_then_same_mapping_flow(
             json={"temperature": 22.5, "online": True},
         )
         assert response.status == HTTPStatus.OK
-        assert await response.json() == {"ok": True, "captured": True, "fields": 2}
+        assert await response.json() == {"ok": True, "captured": True, "fields": 3}
 
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"], user_input={}
@@ -225,10 +341,7 @@ async def test_live_capture_uses_temporary_webhook_then_same_mapping_flow(
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"], user_input={CONF_FIELDS: ["/temperature"]}
         )
-        result = await hass.config_entries.subentries.async_configure(
-            result["flow_id"],
-            user_input={FIELD_NAME: "Temperature", FIELD_PLATFORM: PLATFORM_SENSOR},
-        )
+        result = await _configure_normal_sensor(hass, result, name="Temperature")
         assert result["step_id"] == "confirm"
         assert "final-webhook-id" in result["description_placeholders"]["webhook_url"]
         result = await hass.config_entries.subentries.async_configure(
@@ -241,12 +354,12 @@ async def test_live_capture_uses_temporary_webhook_then_same_mapping_flow(
     assert CONF_SAMPLE_PAYLOAD not in source.data
 
 
-async def test_live_capture_rejects_bad_or_container_only_payloads(
+async def test_live_capture_rejects_bad_json_but_accepts_empty_container(
     hass: HomeAssistant,
     hass_client,
     entry_factory,
 ) -> None:
-    """Only a valid JSON payload with selectable scalar leaves completes capture."""
+    """Structured payloads including empty containers should be valid capture samples."""
     parent = entry_factory()
     hass.config_entries.async_remove_subentry(parent, "test-source-subentry")
 
@@ -272,14 +385,13 @@ async def test_live_capture_rejects_bad_or_container_only_payloads(
         assert (await response.json())["error"] == "invalid_json"
 
         response = await client.post("/api/webhook/capture-webhook", json={})
-        assert response.status == HTTPStatus.UNPROCESSABLE_ENTITY
-        assert (await response.json())["error"] == "no_scalar_fields"
+        assert response.status == HTTPStatus.OK
+        assert await response.json() == {"ok": True, "captured": True, "fields": 1}
 
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"], user_input={}
         )
-        assert result["step_id"] == "capture"
-        assert result["errors"]["base"] == "no_payload_received"
+        assert result["step_id"] == "select_fields"
         hass.config_entries.subentries.async_abort(result["flow_id"])
 
 
@@ -313,10 +425,7 @@ async def test_nonlocal_source_prefers_nabu_casa_cloudhook(
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"], user_input={CONF_FIELDS: ["/value"]}
         )
-        result = await hass.config_entries.subentries.async_configure(
-            result["flow_id"],
-            user_input={FIELD_NAME: "Value", FIELD_PLATFORM: PLATFORM_SENSOR},
-        )
+        result = await _configure_normal_sensor(hass, result, name="Value")
 
         assert result["step_id"] == "confirm"
         assert result["description_placeholders"]["webhook_url"] == (
@@ -367,10 +476,7 @@ async def test_local_only_source_does_not_create_cloudhook(
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"], user_input={CONF_FIELDS: ["/value"]}
         )
-        result = await hass.config_entries.subentries.async_configure(
-            result["flow_id"],
-            user_input={FIELD_NAME: "Value", FIELD_PLATFORM: PLATFORM_SENSOR},
-        )
+        result = await _configure_normal_sensor(hass, result, name="Value")
 
     assert "192.168.1.2" in result["description_placeholders"]["webhook_url"]
     get_cloud.assert_not_called()
@@ -460,10 +566,7 @@ async def test_live_reconfigure_uses_temporary_webhook_and_preserves_real_id(
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"], user_input={CONF_FIELDS: ["/new_value"]}
         )
-        result = await hass.config_entries.subentries.async_configure(
-            result["flow_id"],
-            user_input={FIELD_NAME: "New value", FIELD_PLATFORM: PLATFORM_SENSOR},
-        )
+        result = await _configure_normal_sensor(hass, result, name="New value")
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"], user_input={}
         )

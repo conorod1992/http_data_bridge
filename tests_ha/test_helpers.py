@@ -2,6 +2,7 @@
 
 from custom_components.http_data_bridge.helpers import (
     get_by_pointer,
+    iter_json_nodes,
     iter_scalar_fields,
     normalise_sensor_value,
     pointer_to_label,
@@ -24,12 +25,23 @@ def test_nested_fields_and_json_pointer_escaping() -> None:
     assert pointer_to_label("/rooms/0/temperature") == "rooms[0].temperature"
 
 
+def test_all_json_nodes_include_root_and_containers() -> None:
+    """Setup discovery should expose the full payload and nested structured values."""
+    payload = {"items": [{"id": 1}], "status": "ok"}
+    nodes = dict(iter_json_nodes(payload))
+    assert nodes[""] == payload
+    assert nodes["/items"] == [{"id": 1}]
+    assert nodes["/items/0"] == {"id": 1}
+    assert nodes["/items/0/id"] == 1
+    assert nodes["/status"] == "ok"
+
+
 def test_root_scalar_uses_empty_pointer() -> None:
     """A scalar JSON document should still be mappable."""
     assert list(iter_scalar_fields(42)) == [("", 42)]
     assert get_by_pointer(42, "") == 42
     assert pointer_to_label("") == "$"
-    assert suggested_name("") == "Value"
+    assert suggested_name("") == "Payload"
 
 
 def test_missing_path_raises_key_error() -> None:
@@ -63,8 +75,11 @@ def test_display_and_sensor_normalisation() -> None:
     """Labels and sensor values should stay compact and HA-friendly."""
     assert sample_display(True) == "true"
     assert sample_display(None) == "null"
+    assert sample_display({"a": 1}) == "object (1 key)"
+    assert sample_display([1, 2]) == "array (2 items)"
     assert sample_display("x" * 100, limit=10) == "xxxxxxxxx…"
     assert normalise_sensor_value(True) == "on"
     assert normalise_sensor_value(False) == "off"
     assert normalise_sensor_value(None) is None
     assert normalise_sensor_value(12.5) == 12.5
+    assert normalise_sensor_value({"a": 1}) is None

@@ -63,12 +63,13 @@ def _unescape_pointer_part(part: str) -> str:
     return part.replace("~1", "/").replace("~0", "~")
 
 
-def iter_scalar_fields(value: JsonValue, pointer: str = "") -> Iterator[tuple[str, JsonValue]]:
-    """Yield JSON Pointer paths for scalar leaf values without recursive traversal."""
+def iter_json_nodes(value: JsonValue, pointer: str = "") -> Iterator[tuple[str, JsonValue]]:
+    """Yield every JSON node, including root and containers, without recursion."""
     stack: list[tuple[str, JsonValue]] = [(pointer, value)]
 
     while stack:
         current_pointer, current = stack.pop()
+        yield current_pointer, current
 
         if isinstance(current, dict):
             # Reverse before pushing so iteration order remains the same as the
@@ -78,16 +79,17 @@ def iter_scalar_fields(value: JsonValue, pointer: str = "") -> Iterator[tuple[st
                     f"{current_pointer}/{_escape_pointer_part(str(key))}"
                 )
                 stack.append((child_pointer, child))
-            continue
-
-        if isinstance(current, list):
+        elif isinstance(current, list):
             for index in range(len(current) - 1, -1, -1):
                 child_pointer = f"{current_pointer}/{index}"
                 stack.append((child_pointer, current[index]))
-            continue
 
-        # Root scalars are represented by an empty pointer.
-        yield current_pointer, current
+
+def iter_scalar_fields(value: JsonValue, pointer: str = "") -> Iterator[tuple[str, JsonValue]]:
+    """Yield JSON Pointer paths for scalar leaf values without recursive traversal."""
+    for current_pointer, current in iter_json_nodes(value, pointer):
+        if not isinstance(current, (dict, list)):
+            yield current_pointer, current
 
 
 def get_by_pointer(value: JsonValue, pointer: str) -> JsonValue:
@@ -139,7 +141,7 @@ def suggested_name(pointer: str) -> str:
     """Create a human-friendly default name from a pointer."""
     label = pointer_to_label(pointer)
     if label == "$":
-        return "Value"
+        return "Payload"
     leaf = label.rsplit(".", 1)[-1]
     if "[" in leaf and leaf.endswith("]"):
         leaf = leaf.split("[", 1)[0] or "Value"
@@ -152,6 +154,12 @@ def sample_display(value: JsonValue, *, limit: int = 80) -> str:
         text = "null"
     elif isinstance(value, bool):
         text = "true" if value else "false"
+    elif isinstance(value, dict):
+        count = len(value)
+        text = f"object ({count} key{'s' if count != 1 else ''})"
+    elif isinstance(value, list):
+        count = len(value)
+        text = f"array ({count} item{'s' if count != 1 else ''})"
     else:
         text = str(value)
 
@@ -168,5 +176,4 @@ def normalise_sensor_value(value: JsonValue) -> str | int | float | None:
         return "on" if value else "off"
     if isinstance(value, (str, int, float)):
         return value
-    # Configured fields are scalar leaves, but keep runtime defensive.
-    return str(value)
+    return None

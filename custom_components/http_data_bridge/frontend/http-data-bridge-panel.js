@@ -10,6 +10,9 @@ class HttpDataBridgePanel extends HTMLElement {
     this._revealed = new Set();
     this._copyMessage = "";
     this._pollTimer = null;
+    this._viewing = null;
+    this._viewLoading = false;
+    this._viewError = null;
     this.shadowRoot.addEventListener("click", (event) => this._handleClick(event));
   }
 
@@ -75,6 +78,12 @@ class HttpDataBridgePanel extends HTMLElement {
       window.dispatchEvent(new Event("location-changed"));
       return;
     }
+    if (action === "close-value") {
+      this._viewing = null;
+      this._viewError = null;
+      this._render();
+      return;
+    }
 
     const sourceId = target.dataset.sourceId;
     if (!sourceId || !this._data) return;
@@ -89,6 +98,44 @@ class HttpDataBridgePanel extends HTMLElement {
     }
     if (action === "copy") {
       void this._copy(source.webhook_url, source.name);
+      return;
+    }
+    if (action === "view-value") {
+      const path = target.dataset.path ?? "";
+      const field = source.fields.find((item) => item.path === path);
+      if (field) void this._viewAttributeValue(source, field);
+    }
+  }
+
+  async _viewAttributeValue(source, field) {
+    if (!this._hass || this._viewLoading) return;
+    this._viewLoading = true;
+    this._viewError = null;
+    this._viewing = {
+      sourceName: source.name,
+      fieldName: field.name,
+      path: field.path,
+      available: false,
+      value: null,
+    };
+    this._render();
+
+    try {
+      const result = await this._hass.connection.sendMessagePromise({
+        type: "http_data_bridge/attribute_value",
+        source_id: source.source_id,
+        path: field.path,
+      });
+      this._viewing = {
+        ...this._viewing,
+        available: Boolean(result.available),
+        value: result.value,
+      };
+    } catch (err) {
+      this._viewError = err instanceof Error ? err.message : String(err);
+    } finally {
+      this._viewLoading = false;
+      this._render();
     }
   }
 
@@ -134,6 +181,11 @@ class HttpDataBridgePanel extends HTMLElement {
     return this._escape(text);
   }
 
+  _formatFullValue(value) {
+    if (typeof value === "string") return value;
+    return JSON.stringify(value, null, 2);
+  }
+
   _formatTime(value) {
     if (!value) return "Never";
     const date = new Date(value);
@@ -161,19 +213,29 @@ class HttpDataBridgePanel extends HTMLElement {
     const staleText = source.stale_after > 0 ? `${source.stale_after} seconds` : "Never expires";
     const fields = source.fields.length
       ? source.fields
-          .map(
-            (field) => `
+          .map((field) => {
+            const typeText = field.attribute_backed
+              ? "sensor · attribute storage"
+              : `${field.platform}${field.unit ? ` · ${this._escape(field.unit)}` : ""}`;
+            let currentValue = "Unavailable";
+            if (field.available && field.attribute_backed) {
+              currentValue = `<button class="link-button" data-action="view-value" data-source-id="${this._escape(
+                source.source_id
+              )}" data-path="${this._escape(field.path)}">View value</button>`;
+            } else if (field.available) {
+              currentValue = this._formatValue(field.value);
+            }
+
+            return `
               <tr>
                 <td>
                   <div class="field-name">${this._escape(field.name)}</div>
                   <div class="field-path">${this._escape(field.path_label)}</div>
                 </td>
-                <td>${this._escape(field.platform)}${field.unit ? ` · ${this._escape(field.unit)}` : ""}</td>
-                <td class="value ${field.available ? "" : "muted"}">${
-                  field.available ? this._formatValue(field.value) : "Unavailable"
-                }</td>
-              </tr>`
-          )
+                <td>${typeText}</td>
+                <td class="value ${field.available ? "" : "muted"}">${currentValue}</td>
+              </tr>`;
+          })
           .join("")
       : `<tr><td colspan="3" class="muted">No mapped fields</td></tr>`;
 
@@ -220,6 +282,36 @@ class HttpDataBridgePanel extends HTMLElement {
       </section>`;
   }
 
+  _valueDialog() {
+    if (!this._viewing) return "";
+    let body;
+    if (this._viewLoading) {
+      body = `<div class="modal-message">Loading value…</div>`;
+    } else if (this._viewError) {
+      body = `<div class="modal-message error">${this._escape(this._viewError)}</div>`;
+    } else if (!this._viewing.available) {
+      body = `<div class="modal-message muted">This value is currently unavailable.</div>`;
+    } else {
+      body = `<pre>${this._escape(this._formatFullValue(this._viewing.value))}</pre>`;
+    }
+
+    return `
+      <div class="modal-backdrop">
+        <section class="modal" role="dialog" aria-modal="true">
+          <div class="modal-head">
+            <div>
+              <h2>${this._escape(this._viewing.fieldName)}</h2>
+              <div class="meta">${this._escape(this._viewing.sourceName)} · ${this._escape(
+                this._viewing.path || "$"
+              )}</div>
+            </div>
+            <button data-action="close-value">Close</button>
+          </div>
+          ${body}
+        </section>
+      </div>`;
+  }
+
   _render() {
     if (!this.shadowRoot) return;
     const sources = this._data?.sources || [];
@@ -244,6 +336,7 @@ class HttpDataBridgePanel extends HTMLElement {
         button:hover { background: var(--secondary-background-color); }
         .primary { background: var(--primary-color); color: var(--text-primary-color, white); border-color: var(--primary-color); }
         .primary-small { background: var(--primary-color); color: var(--text-primary-color, white); border-color: var(--primary-color); }
+        .link-button { padding: 4px 8px; color: var(--primary-color); }
         .copy-message { margin: -8px 0 16px; color: var(--success-color, #43a047); font-size: 14px; }
         .card { background: var(--card-background-color); border-radius: var(--ha-card-border-radius, 12px); box-shadow: var(--ha-card-box-shadow, 0 2px 6px rgba(0,0,0,.12)); padding: 20px; margin-bottom: 18px; }
         .card-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
@@ -272,6 +365,11 @@ class HttpDataBridgePanel extends HTMLElement {
         .value { overflow-wrap: anywhere; max-width: 380px; }
         .message { background: var(--card-background-color); border-radius: 12px; padding: 24px; color: var(--secondary-text-color); }
         .error { color: var(--error-color); }
+        .modal-backdrop { position: fixed; inset: 0; z-index: 20; background: rgba(0,0,0,.48); display: flex; align-items: center; justify-content: center; padding: 20px; }
+        .modal { width: min(900px, 100%); max-height: 85vh; overflow: auto; background: var(--card-background-color); border-radius: var(--ha-card-border-radius, 12px); box-shadow: 0 8px 30px rgba(0,0,0,.35); padding: 20px; }
+        .modal-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 16px; }
+        .modal pre { margin: 0; padding: 14px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--primary-background-color); border-radius: 8px; font-family: monospace; }
+        .modal-message { padding: 18px 0; }
         @media (max-width: 700px) {
           .page { padding: 16px; }
           header { flex-direction: column; }
@@ -295,7 +393,8 @@ class HttpDataBridgePanel extends HTMLElement {
         </header>
         ${this._copyMessage ? `<div class="copy-message">${this._escape(this._copyMessage)}</div>` : ""}
         ${body}
-      </div>`;
+      </div>
+      ${this._valueDialog()}`;
   }
 }
 

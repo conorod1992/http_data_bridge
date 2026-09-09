@@ -60,7 +60,7 @@
             "sample_payload": "Example JSON payload"
           },
           "data_description": {
-            "sample_payload": "Objects and arrays are inspected recursively; you will choose the individual scalar values to expose next."
+            "sample_payload": "Objects and arrays are inspected recursively. You can expose individual values, a structured object/array, or the complete payload."
           }
         },
         "capture": {
@@ -69,21 +69,32 @@
         },
         "select_fields": {
           "title": "Choose values",
-          "description": "Select the scalar JSON values that should become Home Assistant entities. Objects and arrays are shown through their individual leaf values.",
+          "description": "Select what should become Home Assistant entities. You can choose scalar values, nested objects/arrays, or `$` for the complete JSON payload. Structured or long values can be stored in a sensor attribute.",
           "data": {
             "fields": "Values to expose"
           }
         },
         "configure_field": {
           "title": "Configure value {current} of {total}",
-          "description": "**JSON path:** `{field_path}`\n\n**Example value:** `{sample_value}`",
+          "description": "**JSON path:** `{field_path}`\n\n**Example:** `{sample_value}`\n\n{type_guidance}",
           "data": {
             "name": "Entity name",
-            "platform": "Entity type",
+            "platform": "Entity type"
+          },
+          "data_description": {
+            "platform": "Sensor is for ordinary values. Binary sensor is available for JSON true/false and represents an on/off state."
+          }
+        },
+        "configure_sensor": {
+          "title": "Sensor storage",
+          "description": "{storage_guidance}\n\nHome Assistant sensor states are limited to {state_limit} characters. With attribute storage enabled, the sensor state is the time the value was received and the complete JSON value is available in the `value` attribute.",
+          "data": {
+            "store_in_attribute": "Store value in an attribute",
             "unit": "Unit of measurement"
           },
           "data_description": {
-            "unit": "Optional. Available for numeric sensors. Boolean values can be exposed as binary sensors."
+            "store_in_attribute": "Use this for long text, objects, arrays, or a complete JSON payload. The `value` attribute is excluded from Recorder history to avoid database growth.",
+            "unit": "Optional for a normal numeric sensor. Units are not available when the value is stored in an attribute because the sensor state becomes a timestamp."
           }
         },
         "confirm": {
@@ -98,12 +109,12 @@
       "error": {
         "invalid_json": "Enter valid JSON.",
         "payload_too_large": "The example payload is too large. The maximum size is 256 KiB.",
-        "no_scalar_fields": "The payload does not contain any scalar values that can become entities.",
         "no_payload_received": "No valid payload has been captured yet. Send a JSON POST to the temporary URL, then continue.",
         "select_at_least_one": "Select at least one value.",
         "binary_requires_boolean": "Only JSON true/false values can be configured as binary sensors.",
         "empty_name": "Enter a name.",
-        "unit_requires_number": "A unit of measurement can only be used with a numeric example value."
+        "attribute_required": "This example cannot fit safely in a normal Home Assistant sensor state. Keep attribute storage enabled.",
+        "attribute_cannot_have_unit": "Remove the unit or disable attribute storage. Attribute-backed sensors use a timestamp as their state."
       },
       "abort": {
         "reconfigure_successful": "HTTP Data Bridge source was reconfigured successfully."
