@@ -16,7 +16,9 @@ jobs:
         with:
           python-version: "3.13"
       - name: Compile Python
-        run: python -m compileall -q custom_components/http_data_bridge
+        run: python -m compileall -q custom_components/http_data_bridge scripts
+      - name: Validate release version metadata
+        run: python scripts/set_release_version.py --check
 
   ha-contracts:
     name: HA contracts (${{ matrix.homeassistant }})
