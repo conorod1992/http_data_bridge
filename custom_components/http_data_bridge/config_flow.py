@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from http import HTTPStatus
 import json
 from typing import Any, override
 from uuid import uuid4
 
+from aiohttp.web import Request, Response, json_response
 import voluptuous as vol
 
 from homeassistant import config_entries
@@ -19,7 +21,7 @@ from homeassistant.config_entries import (
     SubentryFlowContext,
     SubentryFlowResult,
 )
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er, selector
 
 from .const import (
@@ -27,6 +29,7 @@ from .const import (
     CONF_ENABLED,
     CONF_FIELDS,
     CONF_LOCAL_ONLY,
+    CONF_SAMPLE_METHOD,
     CONF_SAMPLE_PAYLOAD,
     CONF_SOURCE_ID,
     CONF_SOURCE_NAME,
@@ -42,6 +45,9 @@ from .const import (
     PARENT_TITLE,
     PLATFORM_BINARY_SENSOR,
     PLATFORM_SENSOR,
+    SAMPLE_METHOD_KEEP,
+    SAMPLE_METHOD_LIVE,
+    SAMPLE_METHOD_PASTE,
     SUBENTRY_TYPE_SOURCE,
 )
 from .helpers import (
@@ -52,7 +58,13 @@ from .helpers import (
     sample_display,
     suggested_name,
 )
-from .webhooks import async_delete_cloudhook, async_resolve_webhook_url
+from .webhooks import (
+    PayloadValidationError,
+    async_delete_cloudhook,
+    async_read_json_payload,
+    async_resolve_webhook_url,
+    payload_error_response,
+)
 
 _JSON_TEXT_SELECTOR = selector.TextSelector(
     selector.TextSelectorConfig(multiline=True)
@@ -66,6 +78,38 @@ _STALE_SELECTOR = selector.NumberSelector(
         unit_of_measurement="s",
     )
 )
+_NEW_SAMPLE_METHOD_SELECTOR = selector.SelectSelector(
+    selector.SelectSelectorConfig(
+        options=[
+            selector.SelectOptionDict(
+                value=SAMPLE_METHOD_LIVE,
+                label="Capture a live request",
+            ),
+            selector.SelectOptionDict(
+                value=SAMPLE_METHOD_PASTE,
+                label="Paste example JSON",
+            ),
+        ]
+    )
+)
+_RECONFIGURE_SAMPLE_METHOD_SELECTOR = selector.SelectSelector(
+    selector.SelectSelectorConfig(
+        options=[
+            selector.SelectOptionDict(
+                value=SAMPLE_METHOD_KEEP,
+                label="Keep existing mappings",
+            ),
+            selector.SelectOptionDict(
+                value=SAMPLE_METHOD_LIVE,
+                label="Capture a live request and replace mappings",
+            ),
+            selector.SelectOptionDict(
+                value=SAMPLE_METHOD_PASTE,
+                label="Paste example JSON and replace mappings",
+            ),
+        ]
+    )
+)
 
 
 def _parse_sample(raw: str) -> JsonValue:
@@ -73,6 +117,14 @@ def _parse_sample(raw: str) -> JsonValue:
     if len(raw.encode("utf-8")) > MAX_PAYLOAD_BYTES:
         raise OverflowError
     return parse_json(raw)
+
+
+def _scalar_fields(sample: JsonValue) -> dict[str, JsonValue]:
+    """Return selectable scalar leaves, rejecting container-only samples."""
+    fields = dict(iter_scalar_fields(sample))
+    if not fields:
+        raise ValueError("no scalar fields")
+    return fields
 
 
 class HttpDataBridgeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -124,7 +176,7 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
         self._enabled = True
         self._webhook_id = ""
         self._cloudhook_url: str | None = None
-        self._sample_payload: JsonValue | None = None
+        self._sample_payload: JsonValue = None
         self._sample_available = False
         self._sample_fields: dict[str, JsonValue] = {}
         self._selected_paths: list[str] = []
@@ -133,6 +185,14 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
         self._reconfiguring = False
         self._created_cloudhook = False
         self._committed = False
+
+        # Live discovery deliberately uses a separate temporary webhook. This is
+        # required for reconfiguration because the source's real webhook may
+        # already be registered by its active runtime.
+        self._capture_webhook_id = ""
+        self._capture_registered = False
+        self._capture_cloudhook_url: str | None = None
+        self._capture_url = ""
 
     @override
     async def async_step_user(
@@ -143,37 +203,24 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
 
         if user_input is not None:
             source_name = str(user_input[CONF_SOURCE_NAME]).strip()
-            raw_sample = str(user_input[CONF_SAMPLE_PAYLOAD]).strip()
-
             if not source_name:
                 errors[CONF_SOURCE_NAME] = "empty_name"
 
-            try:
-                sample = _parse_sample(raw_sample)
-            except OverflowError:
-                errors[CONF_SAMPLE_PAYLOAD] = "payload_too_large"
-            except (json.JSONDecodeError, ValueError, UnicodeDecodeError, RecursionError):
-                errors[CONF_SAMPLE_PAYLOAD] = "invalid_json"
-            else:
-                sample_fields = dict(iter_scalar_fields(sample))
-                if not sample_fields:
-                    errors[CONF_SAMPLE_PAYLOAD] = "no_scalar_fields"
-
             if not errors:
                 self._source_name = source_name
-                self._source_id = uuid4().hex
                 self._stale_after = int(user_input[CONF_STALE_AFTER])
                 self._local_only = bool(user_input[CONF_LOCAL_ONLY])
                 self._enabled = bool(user_input[CONF_ENABLED])
-                self._webhook_id = webhook.async_generate_id()
-                self._sample_payload = sample
-                self._sample_available = True
-                self._sample_fields = sample_fields
-                return await self.async_step_select_fields()
+                self._ensure_source_identity()
+
+                method = str(user_input[CONF_SAMPLE_METHOD])
+                if method == SAMPLE_METHOD_LIVE:
+                    return await self.async_step_capture()
+                return await self.async_step_sample()
 
         return self.async_show_form(
             step_id="user",
-            data_schema=self._source_schema(user_input or {}),
+            data_schema=self._source_schema(user_input or {}, reconfigure=False),
             errors=errors,
         )
 
@@ -194,66 +241,44 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
 
         if user_input is not None:
             source_name = str(user_input[CONF_SOURCE_NAME]).strip()
-            raw_sample = str(user_input.get(CONF_SAMPLE_PAYLOAD, "")).strip()
-
             if not source_name:
                 errors[CONF_SOURCE_NAME] = "empty_name"
 
-            self._source_name = source_name
-            self._stale_after = int(user_input[CONF_STALE_AFTER])
-            self._local_only = bool(user_input[CONF_LOCAL_ONLY])
-            self._enabled = bool(user_input[CONF_ENABLED])
+            if not errors:
+                self._source_name = source_name
+                self._stale_after = int(user_input[CONF_STALE_AFTER])
+                self._local_only = bool(user_input[CONF_LOCAL_ONLY])
+                self._enabled = bool(user_input[CONF_ENABLED])
 
-            if not errors and not raw_sample:
-                self._field_configs = list(subentry.data.get(CONF_FIELDS, []))
-                return await self.async_step_confirm_existing()
-
-            if raw_sample:
-                try:
-                    sample = _parse_sample(raw_sample)
-                except OverflowError:
-                    errors[CONF_SAMPLE_PAYLOAD] = "payload_too_large"
-                except (
-                    json.JSONDecodeError,
-                    ValueError,
-                    UnicodeDecodeError,
-                    RecursionError,
-                ):
-                    errors[CONF_SAMPLE_PAYLOAD] = "invalid_json"
-                else:
-                    sample_fields = dict(iter_scalar_fields(sample))
-                    if not sample_fields:
-                        errors[CONF_SAMPLE_PAYLOAD] = "no_scalar_fields"
-                    elif not errors:
-                        self._sample_payload = sample
-                        self._sample_available = True
-                        self._sample_fields = sample_fields
-                        return await self.async_step_select_fields()
+                method = str(user_input[CONF_SAMPLE_METHOD])
+                if method == SAMPLE_METHOD_KEEP:
+                    self._field_configs = list(subentry.data.get(CONF_FIELDS, []))
+                    return await self.async_step_confirm_existing()
+                if method == SAMPLE_METHOD_LIVE:
+                    return await self.async_step_capture()
+                return await self.async_step_sample()
 
         defaults = dict(subentry.data)
-        defaults[CONF_SAMPLE_PAYLOAD] = ""
+        defaults[CONF_SAMPLE_METHOD] = SAMPLE_METHOD_KEEP
         return self.async_show_form(
             step_id="reconfigure",
-            data_schema=self._source_schema(user_input or defaults, reconfigure=True),
+            data_schema=self._source_schema(
+                defaults if user_input is None else user_input,
+                reconfigure=True,
+            ),
             errors=errors,
         )
 
     def _source_schema(
-        self, values: dict[str, Any], *, reconfigure: bool = False
+        self, values: dict[str, Any], *, reconfigure: bool
     ) -> vol.Schema:
         """Build source settings schema."""
-        sample_default = "" if reconfigure else '{\n  "temperature": 21.4,\n  "online": true\n}'
-        sample_marker: vol.Marker
-        if reconfigure:
-            sample_marker = vol.Optional(
-                CONF_SAMPLE_PAYLOAD,
-                default=values.get(CONF_SAMPLE_PAYLOAD, sample_default),
-            )
-        else:
-            sample_marker = vol.Required(
-                CONF_SAMPLE_PAYLOAD,
-                default=values.get(CONF_SAMPLE_PAYLOAD, sample_default),
-            )
+        method_default = SAMPLE_METHOD_KEEP if reconfigure else SAMPLE_METHOD_LIVE
+        method_selector = (
+            _RECONFIGURE_SAMPLE_METHOD_SELECTOR
+            if reconfigure
+            else _NEW_SAMPLE_METHOD_SELECTOR
+        )
 
         return vol.Schema(
             {
@@ -261,7 +286,10 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
                     CONF_SOURCE_NAME,
                     default=values.get(CONF_SOURCE_NAME, "Push source"),
                 ): _TEXT_SELECTOR,
-                sample_marker: _JSON_TEXT_SELECTOR,
+                vol.Required(
+                    CONF_SAMPLE_METHOD,
+                    default=values.get(CONF_SAMPLE_METHOD, method_default),
+                ): method_selector,
                 vol.Required(
                     CONF_STALE_AFTER,
                     default=values.get(CONF_STALE_AFTER, DEFAULT_STALE_AFTER),
@@ -275,6 +303,68 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
                     default=values.get(CONF_ENABLED, True),
                 ): selector.BooleanSelector(),
             }
+        )
+
+    async def async_step_sample(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Accept a pasted example JSON payload."""
+        errors: dict[str, str] = {}
+        raw_sample = (
+            str(user_input.get(CONF_SAMPLE_PAYLOAD, "")).strip()
+            if user_input is not None
+            else ""
+        )
+
+        if user_input is not None:
+            try:
+                sample = _parse_sample(raw_sample)
+            except OverflowError:
+                errors[CONF_SAMPLE_PAYLOAD] = "payload_too_large"
+            except (json.JSONDecodeError, ValueError, UnicodeDecodeError, RecursionError):
+                errors[CONF_SAMPLE_PAYLOAD] = "invalid_json"
+            else:
+                try:
+                    sample_fields = _scalar_fields(sample)
+                except ValueError:
+                    errors[CONF_SAMPLE_PAYLOAD] = "no_scalar_fields"
+                else:
+                    self._set_sample(sample, sample_fields)
+                    return await self.async_step_select_fields()
+
+        return self.async_show_form(
+            step_id="sample",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_SAMPLE_PAYLOAD,
+                        default=(
+                            raw_sample
+                            if raw_sample
+                            else '{\n  "temperature": 21.4,\n  "online": true\n}'
+                        ),
+                    ): _JSON_TEXT_SELECTOR
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_capture(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Capture one real request through a temporary webhook."""
+        capture_url = await self._ensure_capture_endpoint()
+
+        if user_input is not None and self._sample_available:
+            await self._async_cleanup_capture()
+            return await self.async_step_select_fields()
+
+        errors = {"base": "no_payload_received"} if user_input is not None else {}
+        return self.async_show_form(
+            step_id="capture",
+            data_schema=vol.Schema({}),
+            description_placeholders={"capture_url": capture_url},
+            errors=errors,
         )
 
     async def async_step_select_fields(
@@ -441,8 +531,95 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
             description_placeholders={"webhook_url": await self._webhook_url()},
         )
 
+    def _ensure_source_identity(self) -> None:
+        """Allocate stable source identity once for a new source flow."""
+        if not self._source_id:
+            self._source_id = uuid4().hex
+        if not self._webhook_id:
+            self._webhook_id = webhook.async_generate_id()
+
+    def _set_sample(
+        self, sample: JsonValue, sample_fields: dict[str, JsonValue]
+    ) -> None:
+        """Store one setup-only sample in flow memory."""
+        self._sample_payload = sample
+        self._sample_fields = sample_fields
+        self._sample_available = True
+
+    async def _ensure_capture_endpoint(self) -> str:
+        """Register and resolve the temporary live-capture endpoint."""
+        if self._capture_registered:
+            return self._capture_url
+
+        self._capture_webhook_id = webhook.async_generate_id()
+        webhook.async_register(
+            self.hass,
+            DOMAIN,
+            f"{self._source_name} setup capture",
+            self._capture_webhook_id,
+            self._async_handle_capture,
+            local_only=self._local_only,
+            allowed_methods={"POST"},
+        )
+        self._capture_registered = True
+
+        try:
+            url, cloudhook_url, _created = await async_resolve_webhook_url(
+                self.hass,
+                {
+                    CONF_WEBHOOK_ID: self._capture_webhook_id,
+                    CONF_LOCAL_ONLY: self._local_only,
+                },
+            )
+        except Exception:
+            webhook.async_unregister(self.hass, self._capture_webhook_id)
+            self._capture_registered = False
+            self._capture_webhook_id = ""
+            raise
+
+        self._capture_url = url
+        self._capture_cloudhook_url = cloudhook_url
+        return url
+
+    async def _async_handle_capture(
+        self, _hass: HomeAssistant, _webhook_id: str, request: Request
+    ) -> Response:
+        """Capture the latest valid JSON request without persisting it."""
+        try:
+            sample = await async_read_json_payload(request)
+        except PayloadValidationError as err:
+            return payload_error_response(err)
+
+        sample_fields = dict(iter_scalar_fields(sample))
+        if not sample_fields:
+            return json_response(
+                {"ok": False, "error": "no_scalar_fields"},
+                status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+
+        self._set_sample(sample, sample_fields)
+        return json_response(
+            {"ok": True, "captured": True, "fields": len(sample_fields)}
+        )
+
+    async def _async_cleanup_capture(self) -> None:
+        """Remove a temporary capture webhook/cloudhook."""
+        capture_webhook_id = self._capture_webhook_id
+        if self._capture_registered and capture_webhook_id:
+            webhook.async_unregister(self.hass, capture_webhook_id)
+            self._capture_registered = False
+
+        if self._capture_cloudhook_url and capture_webhook_id:
+            await async_delete_cloudhook(self.hass, capture_webhook_id)
+
+        self._capture_webhook_id = ""
+        self._capture_cloudhook_url = None
+        self._capture_url = ""
+
     async def _finish_flow(self) -> SubentryFlowResult:
         """Create or update the source subentry."""
+        await self._async_cleanup_capture()
+
         data: dict[str, Any] = {
             CONF_SOURCE_NAME: self._source_name,
             CONF_SOURCE_ID: self._source_id,
@@ -527,7 +704,18 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
     @callback
     @override
     def async_remove(self) -> None:
-        """Clean up a cloudhook created by an abandoned new-source flow."""
+        """Clean up temporary endpoints created by an abandoned flow."""
+        capture_webhook_id = self._capture_webhook_id
+        if self._capture_registered and capture_webhook_id:
+            webhook.async_unregister(self.hass, capture_webhook_id)
+            self._capture_registered = False
+
+        if self._capture_cloudhook_url and capture_webhook_id:
+            self.hass.async_create_task(
+                async_delete_cloudhook(self.hass, capture_webhook_id),
+                "clean abandoned HTTP Data Bridge capture cloudhook",
+            )
+
         if (
             self._created_cloudhook
             and not self._committed
