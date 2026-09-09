@@ -30,6 +30,7 @@ from .const import (
 )
 from .data import HttpDataBridgeManager, async_remove_storage
 from .frontend import async_register_frontend, async_remove_frontend_panel
+from .frontend_management import async_cleanup_management_drafts
 from .webhooks import async_delete_cloudhook
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -219,11 +220,16 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Remove persisted source data, cloudhooks, and panel on parent deletion."""
+    """Remove persisted source data, cloudhooks, drafts, and panel on parent deletion."""
     protected = _migration_removals(hass)
     if entry.entry_id in protected:
         protected.discard(entry.entry_id)
         return
+
+    # A browser can be closed in the middle of a pasted/live setup wizard. Drafts
+    # normally expire automatically, but deleting the integration should remove
+    # temporary capture webhooks/cloudhooks and cancel their expiry timers now.
+    await async_cleanup_management_drafts(hass)
 
     if entry.version == 1:
         await async_remove_storage(hass, entry.entry_id)
