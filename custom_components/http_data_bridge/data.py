@@ -72,10 +72,24 @@ class HttpDataBridgeManager:
                 await runtime.async_load()
                 self.sources[subentry.subentry_id] = runtime
 
+                source_data = dict(subentry.data)
+                # A failed remote->local cloudhook deletion is intentionally kept
+                # as a cleanup marker in source data. Local-only enforcement does
+                # not use this URL; retry cleanup at every setup until Cloud is
+                # reachable (or reports the hook already absent), then forget it.
+                if runtime.local_only and source_data.get(CONF_CLOUDHOOK_URL):
+                    if await async_delete_cloudhook(self.hass, runtime.webhook_id):
+                        source_data.pop(CONF_CLOUDHOOK_URL, None)
+                        runtime.cloudhook_url = None
+                        self.hass.config_entries.async_update_subentry(
+                            self.entry,
+                            subentry,
+                            data=source_data,
+                        )
+
                 if not runtime.enabled:
                     continue
 
-                source_data = dict(subentry.data)
                 _, cloudhook_url, created = await async_resolve_webhook_url(
                     self.hass, source_data
                 )
@@ -120,7 +134,7 @@ class HttpDataBridgeManager:
         return _handle_webhook
 
     async def async_shutdown(self) -> None:
-        """Unload all source runtimes and clean sources removed/restricted by update."""
+        """Unload all source runtimes and clean sources removed by an update."""
         current_by_source_id = {
             str(subentry.data.get(CONF_SOURCE_ID, "")): subentry
             for subentry in self.entry.subentries.values()
@@ -139,13 +153,6 @@ class HttpDataBridgeManager:
                 if runtime.cloudhook_url or not runtime.local_only:
                     await async_delete_cloudhook(self.hass, runtime.webhook_id)
                 await async_remove_storage(self.hass, runtime.source_id)
-                continue
-
-            # A reconfigure may switch a remotely reachable source to local-only.
-            # Ensure an old cloudhook is removed even if the config-flow cleanup
-            # could not reach Home Assistant Cloud at save time.
-            if bool(current.data.get(CONF_LOCAL_ONLY, False)) and runtime.cloudhook_url:
-                await async_delete_cloudhook(self.hass, runtime.webhook_id)
 
 
 class HttpDataBridgeRuntime:
