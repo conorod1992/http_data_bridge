@@ -33,6 +33,13 @@ async def _ws_call(ws_client, payload: dict) -> dict:
     return await ws_client.receive_json()
 
 
+async def _webhook_ids(ws_client) -> set[str]:
+    """Return currently registered webhook ids through HA's public admin API."""
+    message = await _ws_call(ws_client, {"type": "webhook/list"})
+    assert message["success"] is True
+    return {str(item["webhook_id"]) for item in message["result"]}
+
+
 async def test_prepare_pasted_sample_returns_mapping_metadata(
     hass: HomeAssistant,
     hass_ws_client,
@@ -102,6 +109,15 @@ async def test_prepare_null_root_sample_is_not_confused_with_missing_sample(
             "requires_attribute": False,
         }
     ]
+
+    cancelled = await _ws_call(
+        ws_client,
+        {
+            "type": f"{DOMAIN}/source/draft/cancel",
+            "draft_id": prepared["result"]["draft_id"],
+        },
+    )
+    assert cancelled["success"] is True
 
 
 async def test_panel_can_add_source_from_pasted_sample(
@@ -240,6 +256,15 @@ async def test_panel_rejects_mapping_incompatible_with_sample(
     assert bad_container["success"] is False
     assert bad_container["error"]["code"] == "invalid_mapping"
 
+    cancelled = await _ws_call(
+        ws_client,
+        {
+            "type": f"{DOMAIN}/source/draft/cancel",
+            "draft_id": draft_id,
+        },
+    )
+    assert cancelled["success"] is True
+
 
 async def test_panel_edit_keep_mappings_preserves_source_and_webhook_identity(
     hass: HomeAssistant,
@@ -309,6 +334,7 @@ async def test_panel_live_capture_uses_temporary_endpoint_and_cancel_removes_it(
     assert started["success"] is True
     draft_id = started["result"]["draft_id"]
     assert "panel-capture-webhook" in started["result"]["capture_url"]
+    assert "panel-capture-webhook" in await _webhook_ids(ws_client)
 
     client: TestClient = await hass_client()
     response = await client.post(
@@ -340,11 +366,16 @@ async def test_panel_live_capture_uses_temporary_endpoint_and_cancel_removes_it(
         },
     )
     assert cancelled["success"] is True
+    assert "panel-capture-webhook" not in await _webhook_ids(ws_client)
+
+    # Home Assistant intentionally still returns HTTP 200 for unknown webhook IDs
+    # so callers cannot probe whether a secret webhook exists. Registry state is
+    # therefore the authoritative cleanup assertion above.
     response = await client.post(
         "/api/webhook/panel-capture-webhook",
-        json={"message": "should fail"},
+        json={"message": "ignored after cancel"},
     )
-    assert response.status == HTTPStatus.NOT_FOUND
+    assert response.status == HTTPStatus.OK
 
 
 async def test_panel_delete_removes_source_and_unregisters_webhook(
@@ -360,6 +391,7 @@ async def test_panel_delete_removes_source_and_unregisters_webhook(
     ws_client = await hass_ws_client(hass)
     client: TestClient = await hass_client()
 
+    assert "test-http-data-bridge-webhook" in await _webhook_ids(ws_client)
     before = await client.post(
         "/api/webhook/test-http-data-bridge-webhook",
         json={"temperature": 20, "online": True},
@@ -376,9 +408,12 @@ async def test_panel_delete_removes_source_and_unregisters_webhook(
     assert deleted["success"] is True
     await hass.async_block_till_done()
     assert "test-source-subentry" not in entry.subentries
+    assert "test-http-data-bridge-webhook" not in await _webhook_ids(ws_client)
 
+    # Unknown webhook IDs deliberately receive a generic 200 from HA; the payload
+    # is ignored and no HTTP Data Bridge runtime owns the endpoint anymore.
     after = await client.post(
         "/api/webhook/test-http-data-bridge-webhook",
         json={"temperature": 21, "online": True},
     )
-    assert after.status == HTTPStatus.NOT_FOUND
+    assert after.status == HTTPStatus.OK
