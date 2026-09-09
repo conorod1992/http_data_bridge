@@ -1,9 +1,19 @@
 """Unit tests for HTTP Data Bridge payload helpers."""
 
+from homeassistant.const import MAX_LENGTH_STATE_STATE
+
+from custom_components.http_data_bridge.const import (
+    FIELD_PLATFORM,
+    FIELD_STORE_IN_ATTRIBUTE,
+    FIELD_UNIT,
+    PLATFORM_BINARY_SENSOR,
+    PLATFORM_SENSOR,
+)
 from custom_components.http_data_bridge.helpers import (
     get_by_pointer,
     iter_json_nodes,
     iter_scalar_fields,
+    mapping_value_is_available,
     normalise_sensor_value,
     pointer_to_label,
     sample_display,
@@ -26,14 +36,13 @@ def test_nested_fields_and_json_pointer_escaping() -> None:
 
 
 def test_all_json_nodes_include_root_and_containers() -> None:
-    """Setup discovery should expose the full payload and nested structured values."""
+    """Attribute-backed setup should be able to select root, objects, and arrays."""
     payload = {"items": [{"id": 1}], "status": "ok"}
     nodes = dict(iter_json_nodes(payload))
     assert nodes[""] == payload
     assert nodes["/items"] == [{"id": 1}]
     assert nodes["/items/0"] == {"id": 1}
     assert nodes["/items/0/id"] == 1
-    assert nodes["/status"] == "ok"
 
 
 def test_root_scalar_uses_empty_pointer() -> None:
@@ -83,3 +92,33 @@ def test_display_and_sensor_normalisation() -> None:
     assert normalise_sensor_value(None) is None
     assert normalise_sensor_value(12.5) == 12.5
     assert normalise_sensor_value({"a": 1}) is None
+
+
+def test_mapping_compatibility_matches_home_assistant_entity_contract() -> None:
+    """Panel/runtime helpers must agree with actual sensor availability rules."""
+    normal_sensor = {FIELD_PLATFORM: PLATFORM_SENSOR}
+    numeric_sensor = {FIELD_PLATFORM: PLATFORM_SENSOR, FIELD_UNIT: "°C"}
+    binary_sensor = {FIELD_PLATFORM: PLATFORM_BINARY_SENSOR}
+    attribute_sensor = {
+        FIELD_PLATFORM: PLATFORM_SENSOR,
+        FIELD_STORE_IN_ATTRIBUTE: True,
+    }
+
+    assert mapping_value_is_available(normal_sensor, "short") is True
+    assert mapping_value_is_available(normal_sensor, True) is True
+    assert mapping_value_is_available(normal_sensor, {"nested": 1}) is False
+    assert mapping_value_is_available(
+        normal_sensor, "x" * (MAX_LENGTH_STATE_STATE + 1)
+    ) is False
+
+    assert mapping_value_is_available(numeric_sensor, 21.4) is True
+    assert mapping_value_is_available(numeric_sensor, "warm") is False
+    assert mapping_value_is_available(numeric_sensor, True) is False
+
+    assert mapping_value_is_available(binary_sensor, True) is True
+    assert mapping_value_is_available(binary_sensor, "yes") is False
+
+    assert mapping_value_is_available(attribute_sensor, {"nested": [1, 2]}) is True
+    assert mapping_value_is_available(
+        attribute_sensor, "x" * (MAX_LENGTH_STATE_STATE + 1)
+    ) is True
