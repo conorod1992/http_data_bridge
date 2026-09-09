@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import voluptuous as vol
 
@@ -40,6 +41,10 @@ from .webhooks import async_resolve_webhook_url
 _BACKEND_REGISTERED = "frontend_backend_registered"
 _PANEL_REGISTERED = "frontend_panel_registered"
 _PANEL_FILE = "http-data-bridge-panel.js"
+# ES modules are cached by URL for the lifetime of a browser session. Give each
+# Home Assistant process a distinct URL so a HACS/custom-component update cannot
+# leave the management panel running an older JavaScript module after restart.
+_PANEL_CACHE_TOKEN = uuid4().hex
 
 
 async def async_register_frontend(hass: HomeAssistant) -> None:
@@ -85,7 +90,9 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
         webcomponent_name=PANEL_WEBCOMPONENT,
         sidebar_title="HTTP Data Bridge",
         sidebar_icon="mdi:webhook",
-        module_url=f"{PANEL_STATIC_URL}/{_PANEL_FILE}",
+        module_url=(
+            f"{PANEL_STATIC_URL}/{_PANEL_FILE}?v={_PANEL_CACHE_TOKEN}"
+        ),
         require_admin=True,
         config_panel_domain=DOMAIN,
     )
