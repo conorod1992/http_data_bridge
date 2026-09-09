@@ -29,7 +29,7 @@ from .const import (
     SUBENTRY_TYPE_SOURCE,
 )
 from .data import HttpDataBridgeManager, async_remove_storage
-from .frontend import async_register_frontend
+from .frontend import async_register_frontend, async_remove_frontend_panel
 from .webhooks import async_delete_cloudhook
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -95,6 +95,8 @@ async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
     """Set up HTTP Data Bridge, frontend, and legacy-entry consolidation."""
     await async_register_frontend(hass)
     await async_migrate_integration(hass)
+    # Migration can create the first v2 parent after frontend registration.
+    await async_register_frontend(hass)
     return True
 
 
@@ -189,6 +191,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    # The component may have been loaded only to present the initial config flow,
+    # before a parent entry existed. Register the panel now that setup succeeded.
+    await async_register_frontend(hass)
     return True
 
 
@@ -209,7 +214,7 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Remove persisted source data and cloudhooks when the parent is deleted."""
+    """Remove persisted source data, cloudhooks, and panel on parent deletion."""
     protected = _migration_removals(hass)
     if entry.entry_id in protected:
         protected.discard(entry.entry_id)
@@ -220,6 +225,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         webhook_id = entry.data.get(CONF_WEBHOOK_ID)
         if webhook_id and entry.data.get(CONF_CLOUDHOOK_URL):
             await async_delete_cloudhook(hass, str(webhook_id))
+        async_remove_frontend_panel(hass)
         return
 
     for subentry in entry.subentries.values():
@@ -234,3 +240,5 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
             or not bool(subentry.data.get(CONF_LOCAL_ONLY, False))
         ):
             await async_delete_cloudhook(hass, str(webhook_id))
+
+    async_remove_frontend_panel(hass)
