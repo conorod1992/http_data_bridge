@@ -17,6 +17,8 @@ jobs:
           python-version: "3.13"
       - name: Compile Python
         run: python -m compileall -q custom_components/http_data_bridge scripts
+      - name: Check management panel JavaScript
+        run: node --check custom_components/http_data_bridge/frontend/http-data-bridge-panel.js
       - name: Validate release version metadata
         run: python scripts/set_release_version.py --check
 
@@ -53,9 +55,6 @@ jobs:
       - uses: home-assistant/actions/hassfest@master
 
   hacs:
-    # hacs/action currently fetches integration manifests from unauthenticated
-    # raw.githubusercontent.com URLs and therefore cannot validate private repos.
-    # This job becomes active automatically if the repository is made public.
     if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
     steps:
