@@ -43,6 +43,7 @@ def test_all_json_nodes_include_root_and_containers() -> None:
     assert nodes["/items"] == [{"id": 1}]
     assert nodes["/items/0"] == {"id": 1}
     assert nodes["/items/0/id"] == 1
+    assert nodes["/status"] == "ok"
 
 
 def test_root_scalar_uses_empty_pointer() -> None:
