@@ -22,7 +22,10 @@ SAMPLE_METHOD_PASTE = "paste"
 FIELD_NAME = "name"
 FIELD_PATH = "path"
 FIELD_PLATFORM = "platform"
+FIELD_STORE_IN_ATTRIBUTE = "store_in_attribute"
 FIELD_UNIT = "unit"
+
+ATTR_VALUE = "value"
 
 PLATFORM_SENSOR = "sensor"
 PLATFORM_BINARY_SENSOR = "binary_sensor"
