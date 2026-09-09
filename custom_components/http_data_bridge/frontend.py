@@ -7,7 +7,7 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.components import panel_custom, websocket_api
+from homeassistant.components import websocket_api
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.core import HomeAssistant
@@ -32,28 +32,40 @@ from .data import HttpDataBridgeManager, HttpDataBridgeRuntime
 from .helpers import pointer_to_label
 from .webhooks import async_resolve_webhook_url
 
-_FRONTEND_REGISTERED = "frontend_registered"
+_BACKEND_REGISTERED = "frontend_backend_registered"
+_PANEL_REGISTERED = "frontend_panel_registered"
 _PANEL_FILE = "http-data-bridge-panel.js"
 
 
 async def async_register_frontend(hass: HomeAssistant) -> None:
-    """Register the admin-only panel and its WebSocket API once per HA boot."""
+    """Register the management API and, when available, the sidebar panel."""
     domain_data = hass.data.setdefault(DOMAIN, {})
-    if domain_data.get(_FRONTEND_REGISTERED):
+
+    if not domain_data.get(_BACKEND_REGISTERED):
+        websocket_api.async_register_command(hass, websocket_sources)
+
+        frontend_dir = Path(__file__).parent / "frontend"
+        await hass.http.async_register_static_paths(
+            [
+                StaticPathConfig(
+                    PANEL_STATIC_URL,
+                    str(frontend_dir),
+                    cache_headers=False,
+                )
+            ]
+        )
+        domain_data[_BACKEND_REGISTERED] = True
+
+    # The sidebar is an optional presentation layer. Normal Home Assistant
+    # installations have frontend loaded, while headless/test installations may
+    # intentionally omit the separate hass_frontend package. Do not make the
+    # push-data integration itself depend on that package.
+    if "frontend" not in hass.config.components or domain_data.get(_PANEL_REGISTERED):
         return
 
-    websocket_api.async_register_command(hass, websocket_sources)
+    # Import lazily because panel_custom imports frontend at module import time.
+    from homeassistant.components import panel_custom  # noqa: PLC0415
 
-    frontend_dir = Path(__file__).parent / "frontend"
-    await hass.http.async_register_static_paths(
-        [
-            StaticPathConfig(
-                PANEL_STATIC_URL,
-                str(frontend_dir),
-                cache_headers=False,
-            )
-        ]
-    )
     await panel_custom.async_register_panel(
         hass=hass,
         frontend_url_path=PANEL_URL_PATH,
@@ -64,7 +76,7 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
         require_admin=True,
         config_panel_domain=DOMAIN,
     )
-    domain_data[_FRONTEND_REGISTERED] = True
+    domain_data[_PANEL_REGISTERED] = True
 
 
 async def _source_snapshot(
