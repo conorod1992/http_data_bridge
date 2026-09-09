@@ -93,15 +93,23 @@ def _generate_ha_url(hass: HomeAssistant, webhook_id: str, *, local_only: bool) 
 
 
 async def async_delete_cloudhook(hass: HomeAssistant, webhook_id: str) -> bool:
-    """Best-effort deletion of a Home Assistant Cloud cloudhook."""
+    """Best-effort deletion of a Home Assistant Cloud cloudhook.
+
+    Return True when the desired end state is reached. Home Assistant Cloud can
+    raise ValueError when the hook is already absent; that is also a successful
+    cleanup from HTTP Data Bridge's perspective. Cloud unavailability returns
+    False so callers can retain a durable cleanup marker and retry later.
+    """
     if "cloud" not in hass.config.components:
         return False
 
     cloud = _get_cloud_component()
     try:
         await cloud.async_delete_cloudhook(hass, webhook_id)
-    except (cloud.CloudNotAvailable, ValueError):
+    except cloud.CloudNotAvailable:
         return False
+    except ValueError:
+        return True
     return True
 
 
