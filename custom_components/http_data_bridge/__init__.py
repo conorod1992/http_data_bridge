@@ -68,7 +68,10 @@ def _move_registry_ownership(
             legacy_entry.disabled_by is not None
             and disabled_by is er.RegistryEntryDisabler.CONFIG_ENTRY
         ):
-            disabled_by = er.RegistryEntryDisabler.USER
+            # The migrated source has its own CONF_ENABLED flag. Carrying the old
+            # config-entry disable into the entity registry as USER would make the
+            # entity stay disabled even after the source itself is later enabled.
+            disabled_by = None
         entity_registry.async_update_entity(
             entity.entity_id,
             config_entry_id=parent_entry.entry_id,
@@ -82,7 +85,9 @@ def _move_registry_ownership(
             legacy_entry.disabled_by is not None
             and disabled_by is dr.DeviceEntryDisabler.CONFIG_ENTRY
         ):
-            disabled_by = dr.DeviceEntryDisabler.USER
+            # Source-level enablement now owns this state; avoid converting a
+            # temporary config-entry disable into a sticky user device disable.
+            disabled_by = None
         device_registry.async_update_device(
             device.id,
             new_config_entry_id=parent_entry.entry_id,
