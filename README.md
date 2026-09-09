@@ -4,13 +4,14 @@ Turn incoming JSON webhook data into native Home Assistant entities through a gu
 
 HTTP Data Bridge is a custom Home Assistant integration for applications, scripts, websites, and devices that can **push JSON over HTTP** but do not have their own Home Assistant integration or MQTT support.
 
-Instead of building webhook automations, helpers, and templates by hand, you add a push source, paste an example payload, select the values you care about, and HTTP Data Bridge creates normal Home Assistant entities for them.
+Instead of building webhook automations, helpers, and templates by hand, you add a push source, send one representative request (or paste example JSON), select the values you care about, and HTTP Data Bridge creates normal Home Assistant entities for them.
 
 ## What it does
 
 - Uses **one HTTP Data Bridge integration entry with multiple push sources** underneath it.
 - Creates a unique Home Assistant webhook for each source.
 - Uses a guided setup flow; no YAML is required.
+- Can discover the payload structure from a **real test request** or pasted example JSON.
 - Accepts nested JSON objects and arrays.
 - Shows every scalar leaf value in the sample payload and lets you select which ones to expose.
 - Creates normal `sensor` entities for strings/numbers/null values.
@@ -23,6 +24,7 @@ Instead of building webhook automations, helpers, and templates by hand, you add
 - Can restrict a source to requests from the local network.
 - When local-only is disabled and Home Assistant Cloud is available, automatically creates and shows a **Nabu Casa cloudhook URL**.
 - Adds a diagnostic **Last received** timestamp sensor per source.
+- Provides an admin-only management panel showing source health, freshness, mapped values, and webhook endpoints.
 - Keeps the same source identity, webhook ID, entities, and persisted values when a source is reconfigured.
 
 ## Multiple sources
@@ -93,18 +95,28 @@ Copy `custom_components/http_data_bridge` into `/config/custom_components/http_d
 2. Select **Add integration**.
 3. Search for **HTTP Data Bridge**.
 4. The integration creates its parent entry and opens the first **Add source** flow.
-5. Give the source a friendly name.
-6. Paste an example of the JSON your external system will send.
-7. Optionally configure:
-   - **Mark unavailable after** — seconds without a valid payload before its selected entities become unavailable. Use `0` to disable expiry.
-   - **Only allow local network requests** — enable when the sender is entirely on your LAN.
-   - **Enable source** — disable a source without deleting its mappings or webhook identity.
-8. Select the JSON values you want to expose.
-9. Configure each selected value.
-10. Copy the generated webhook URL and one of the sender examples.
-11. Save the source and begin POSTing JSON.
+5. Give the source a friendly name and configure the stale/local-only/enabled settings.
+6. Choose how HTTP Data Bridge should learn the payload:
+   - **Capture a live request** (default) — Home Assistant gives you a temporary setup webhook. Send one representative JSON POST to it, then continue.
+   - **Paste example JSON** — paste a representative payload directly into the setup form.
+7. Select the JSON values you want to expose.
+8. Configure each selected value.
+9. Copy the generated **permanent** webhook URL and one of the sender examples.
+10. Save the source and begin POSTing JSON.
 
-The example payload is only used while the setup flow is open. It is **not** saved in the source configuration.
+The captured or pasted example payload is only kept while the setup flow is open. It is **not** saved in the source configuration. Live discovery uses a separate temporary webhook, which is removed when setup continues or is abandoned; it never replaces the source's permanent webhook ID.
+
+## Management panel
+
+HTTP Data Bridge adds an admin-only sidebar panel. It provides a compact view of all configured sources, including:
+
+- whether each source is receiving data, stale, waiting, disabled, or unloaded;
+- the last received time and configured stale timeout;
+- the currently selected/mapped values and their availability;
+- whether the endpoint is local-only, a Nabu Casa cloudhook, or a normal Home Assistant webhook URL;
+- a masked **Show / Copy** control for the webhook URL.
+
+The panel only exposes values you deliberately mapped. Unselected fields from incoming payloads are not retained for the panel.
 
 ## Local and remote webhook URLs
 
@@ -153,9 +165,9 @@ Array indexes are positional. If the order of an array changes between payloads,
 
 Open the HTTP Data Bridge integration entry and reconfigure the desired source.
 
-You can change the source name, stale timeout, local-only setting, or enabled state without replacing its entity mappings. To replace the mapped fields, paste a new sample JSON payload during reconfiguration and select the desired fields again.
+You can change the source name, stale timeout, local-only setting, or enabled state while keeping the existing entity mappings. To replace the mappings, either capture a new live request or paste a new example payload and select the desired fields again.
 
-The source ID and webhook ID are deliberately preserved.
+Live rediscovery uses a separate temporary webhook, so a currently running source remains on its existing endpoint throughout reconfiguration. The source ID and permanent webhook ID are deliberately preserved.
 
 ## Upgrading from v0.1.x
 
@@ -172,7 +184,9 @@ A Home Assistant webhook/cloudhook URL contains a long random secret.
 - Do not publish or log the complete URL unnecessarily.
 - Anyone who has the complete URL can submit data to that source.
 - Enable **Only allow local network requests** if the sender is entirely local.
+- The management panel is restricted to Home Assistant administrators.
 - Only values explicitly selected during setup are persisted. Unselected fields in incoming payloads are not written to HTTP Data Bridge storage.
+- Live-capture sample payloads exist only in the active setup flow and are not copied into source configuration or panel storage.
 
 ## Data types
 
@@ -210,8 +224,6 @@ without adding MQTT infrastructure.
 The integration is currently push-only. It does not yet:
 
 - poll REST APIs;
-- capture a setup sample automatically from a live incoming request;
-- provide the planned dedicated management frontend;
 - expose structured payloads as a timestamp/payload entity;
 - receive form-encoded payloads;
 - transform values with regex/templates;

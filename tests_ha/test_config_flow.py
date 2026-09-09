@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from http import HTTPStatus
 from unittest.mock import AsyncMock, Mock, patch
+
+from aiohttp.test_utils import TestClient
 
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
@@ -13,6 +16,7 @@ from custom_components.http_data_bridge.const import (
     CONF_ENABLED,
     CONF_FIELDS,
     CONF_LOCAL_ONLY,
+    CONF_SAMPLE_METHOD,
     CONF_SAMPLE_PAYLOAD,
     CONF_SOURCE_ID,
     CONF_SOURCE_NAME,
@@ -26,6 +30,9 @@ from custom_components.http_data_bridge.const import (
     PARENT_TITLE,
     PLATFORM_BINARY_SENSOR,
     PLATFORM_SENSOR,
+    SAMPLE_METHOD_KEEP,
+    SAMPLE_METHOD_LIVE,
+    SAMPLE_METHOD_PASTE,
     SUBENTRY_TYPE_SOURCE,
 )
 
@@ -48,6 +55,34 @@ def _fake_cloud(*, cloudhook_url: str | None = None) -> Mock:
     return cloud
 
 
+async def _enter_pasted_sample(
+    hass: HomeAssistant,
+    parent,
+    *,
+    name: str = "Website status",
+    payload: str = '{"temperature":21.4,"online":true}',
+    stale_after: int = 120,
+    local_only: bool = False,
+) -> dict:
+    """Enter source settings and one pasted setup sample."""
+    result = await _start_source_flow(hass, parent)
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_SOURCE_NAME: name,
+            CONF_SAMPLE_METHOD: SAMPLE_METHOD_PASTE,
+            CONF_STALE_AFTER: stale_after,
+            CONF_LOCAL_ONLY: local_only,
+            CONF_ENABLED: True,
+        },
+    )
+    assert result["step_id"] == "sample"
+    return await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={CONF_SAMPLE_PAYLOAD: payload},
+    )
+
+
 async def test_parent_flow_creates_single_parent_and_chains_source_flow(
     hass: HomeAssistant,
 ) -> None:
@@ -67,11 +102,11 @@ async def test_parent_flow_creates_single_parent_and_chains_source_flow(
     assert result["reason"] == "single_instance_allowed"
 
 
-async def test_guided_source_setup_creates_native_mapping_subentry(
+async def test_pasted_sample_creates_native_mapping_subentry(
     hass: HomeAssistant,
     entry_factory,
 ) -> None:
-    """A sample payload should drive the complete source setup."""
+    """The explicit pasted-sample path should still drive complete setup."""
     parent = entry_factory()
     hass.config_entries.async_remove_subentry(parent, "test-source-subentry")
 
@@ -90,20 +125,7 @@ async def test_guided_source_setup_creates_native_mapping_subentry(
             ),
         ),
     ):
-        result = await _start_source_flow(hass, parent)
-        assert result["type"] is FlowResultType.FORM
-        assert result["step_id"] == "user"
-
-        result = await hass.config_entries.subentries.async_configure(
-            result["flow_id"],
-            user_input={
-                CONF_SOURCE_NAME: "Website status",
-                CONF_SAMPLE_PAYLOAD: '{"temperature":21.4,"online":true}',
-                CONF_STALE_AFTER: 120,
-                CONF_LOCAL_ONLY: False,
-                CONF_ENABLED: True,
-            },
-        )
+        result = await _enter_pasted_sample(hass, parent)
         assert result["step_id"] == "select_fields"
 
         result = await hass.config_entries.subentries.async_configure(
@@ -155,6 +177,112 @@ async def test_guided_source_setup_creates_native_mapping_subentry(
     ]
 
 
+async def test_live_capture_uses_temporary_webhook_then_same_mapping_flow(
+    hass: HomeAssistant,
+    hass_client,
+    entry_factory,
+) -> None:
+    """A real request should be capturable without becoming persisted source data."""
+    parent = entry_factory()
+    hass.config_entries.async_remove_subentry(parent, "test-source-subentry")
+
+    with patch(
+        "custom_components.http_data_bridge.config_flow.webhook.async_generate_id",
+        side_effect=["final-webhook-id", "temporary-capture-id"],
+    ):
+        result = await _start_source_flow(hass, parent)
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_SOURCE_NAME: "Live source",
+                CONF_SAMPLE_METHOD: SAMPLE_METHOD_LIVE,
+                CONF_STALE_AFTER: 0,
+                CONF_LOCAL_ONLY: True,
+                CONF_ENABLED: True,
+            },
+        )
+        assert result["step_id"] == "capture"
+        assert "temporary-capture-id" in result["description_placeholders"]["capture_url"]
+
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={}
+        )
+        assert result["step_id"] == "capture"
+        assert result["errors"]["base"] == "no_payload_received"
+
+        client: TestClient = await hass_client()
+        response = await client.post(
+            "/api/webhook/temporary-capture-id",
+            json={"temperature": 22.5, "online": True},
+        )
+        assert response.status == HTTPStatus.OK
+        assert await response.json() == {"ok": True, "captured": True, "fields": 2}
+
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={}
+        )
+        assert result["step_id"] == "select_fields"
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={CONF_FIELDS: ["/temperature"]}
+        )
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"],
+            user_input={FIELD_NAME: "Temperature", FIELD_PLATFORM: PLATFORM_SENSOR},
+        )
+        assert result["step_id"] == "confirm"
+        assert "final-webhook-id" in result["description_placeholders"]["webhook_url"]
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={}
+        )
+
+    source = next(iter(parent.subentries.values()))
+    assert source.data[CONF_WEBHOOK_ID] == "final-webhook-id"
+    assert source.data[CONF_FIELDS][0][FIELD_PATH] == "/temperature"
+    assert CONF_SAMPLE_PAYLOAD not in source.data
+
+
+async def test_live_capture_rejects_bad_or_container_only_payloads(
+    hass: HomeAssistant,
+    hass_client,
+    entry_factory,
+) -> None:
+    """Only a valid JSON payload with selectable scalar leaves completes capture."""
+    parent = entry_factory()
+    hass.config_entries.async_remove_subentry(parent, "test-source-subentry")
+
+    with patch(
+        "custom_components.http_data_bridge.config_flow.webhook.async_generate_id",
+        side_effect=["final-webhook", "capture-webhook"],
+    ):
+        result = await _start_source_flow(hass, parent)
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_SOURCE_NAME: "Live source",
+                CONF_SAMPLE_METHOD: SAMPLE_METHOD_LIVE,
+                CONF_STALE_AFTER: 0,
+                CONF_LOCAL_ONLY: True,
+                CONF_ENABLED: True,
+            },
+        )
+        client: TestClient = await hass_client()
+
+        response = await client.post("/api/webhook/capture-webhook", data=b"{bad")
+        assert response.status == HTTPStatus.BAD_REQUEST
+        assert (await response.json())["error"] == "invalid_json"
+
+        response = await client.post("/api/webhook/capture-webhook", json={})
+        assert response.status == HTTPStatus.UNPROCESSABLE_ENTITY
+        assert (await response.json())["error"] == "no_scalar_fields"
+
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={}
+        )
+        assert result["step_id"] == "capture"
+        assert result["errors"]["base"] == "no_payload_received"
+        hass.config_entries.subentries.async_abort(result["flow_id"])
+
+
 async def test_nonlocal_source_prefers_nabu_casa_cloudhook(
     hass: HomeAssistant,
     entry_factory,
@@ -175,16 +303,12 @@ async def test_nonlocal_source_prefers_nabu_casa_cloudhook(
             return_value=cloud,
         ),
     ):
-        result = await _start_source_flow(hass, parent)
-        result = await hass.config_entries.subentries.async_configure(
-            result["flow_id"],
-            user_input={
-                CONF_SOURCE_NAME: "Remote source",
-                CONF_SAMPLE_PAYLOAD: '{"value":1}',
-                CONF_STALE_AFTER: 0,
-                CONF_LOCAL_ONLY: False,
-                CONF_ENABLED: True,
-            },
+        result = await _enter_pasted_sample(
+            hass,
+            parent,
+            name="Remote source",
+            payload='{"value":1}',
+            stale_after=0,
         )
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"], user_input={CONF_FIELDS: ["/value"]}
@@ -232,16 +356,13 @@ async def test_local_only_source_does_not_create_cloudhook(
             return_value="http://192.168.1.2:8123/api/webhook/local-webhook-id",
         ),
     ):
-        result = await _start_source_flow(hass, parent)
-        result = await hass.config_entries.subentries.async_configure(
-            result["flow_id"],
-            user_input={
-                CONF_SOURCE_NAME: "LAN source",
-                CONF_SAMPLE_PAYLOAD: '{"value":1}',
-                CONF_STALE_AFTER: 0,
-                CONF_LOCAL_ONLY: True,
-                CONF_ENABLED: True,
-            },
+        result = await _enter_pasted_sample(
+            hass,
+            parent,
+            name="LAN source",
+            payload='{"value":1}',
+            stale_after=0,
+            local_only=True,
         )
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"], user_input={CONF_FIELDS: ["/value"]}
@@ -277,7 +398,7 @@ async def test_settings_only_reconfigure_preserves_ids_and_mappings(
             result["flow_id"],
             user_input={
                 CONF_SOURCE_NAME: "Renamed source",
-                CONF_SAMPLE_PAYLOAD: "",
+                CONF_SAMPLE_METHOD: SAMPLE_METHOD_KEEP,
                 CONF_STALE_AFTER: 300,
                 CONF_LOCAL_ONLY: True,
                 CONF_ENABLED: True,
@@ -298,28 +419,93 @@ async def test_settings_only_reconfigure_preserves_ids_and_mappings(
     assert updated.data[CONF_LOCAL_ONLY] is True
 
 
-async def test_invalid_samples_are_recoverable(
+async def test_live_reconfigure_uses_temporary_webhook_and_preserves_real_id(
     hass: HomeAssistant,
+    hass_client,
     entry_factory,
 ) -> None:
-    """Malformed, non-finite, and pathologically nested samples stay on form."""
+    """Live rediscovery must not collide with an already registered source webhook."""
     parent = entry_factory()
-    hass.config_entries.async_remove_subentry(parent, "test-source-subentry")
-    for sample in ("{not-json}", '{"value":1e400}', "[" * 2000 + "0" + "]" * 2000):
-        result = await _start_source_flow(hass, parent)
+    source = parent.subentries["test-source-subentry"]
+    assert await hass.config_entries.async_setup(parent.entry_id)
+    await hass.async_block_till_done()
+
+    with patch(
+        "custom_components.http_data_bridge.config_flow.webhook.async_generate_id",
+        return_value="reconfigure-capture-webhook",
+    ):
+        result = await parent.start_subentry_reconfigure_flow(hass, source.subentry_id)
         result = await hass.config_entries.subentries.async_configure(
             result["flow_id"],
             user_input={
-                CONF_SOURCE_NAME: "Invalid",
-                CONF_SAMPLE_PAYLOAD: sample,
+                CONF_SOURCE_NAME: "Test source",
+                CONF_SAMPLE_METHOD: SAMPLE_METHOD_LIVE,
                 CONF_STALE_AFTER: 0,
-                CONF_LOCAL_ONLY: False,
+                CONF_LOCAL_ONLY: True,
                 CONF_ENABLED: True,
             },
         )
-        assert result["step_id"] == "user"
-        assert result["errors"][CONF_SAMPLE_PAYLOAD] == "invalid_json"
-        hass.config_entries.subentries.async_abort(result["flow_id"])
+        assert result["step_id"] == "capture"
+        assert "reconfigure-capture-webhook" in result["description_placeholders"]["capture_url"]
+
+        client: TestClient = await hass_client()
+        response = await client.post(
+            "/api/webhook/reconfigure-capture-webhook", json={"new_value": 7}
+        )
+        assert response.status == HTTPStatus.OK
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={}
+        )
+        assert result["step_id"] == "select_fields"
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={CONF_FIELDS: ["/new_value"]}
+        )
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"],
+            user_input={FIELD_NAME: "New value", FIELD_PLATFORM: PLATFORM_SENSOR},
+        )
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], user_input={}
+        )
+
+    updated = parent.subentries[source.subentry_id]
+    assert updated.data[CONF_WEBHOOK_ID] == "test-http-data-bridge-webhook"
+    assert updated.data[CONF_FIELDS][0][FIELD_PATH] == "/new_value"
+
+
+async def test_invalid_pasted_samples_are_recoverable(
+    hass: HomeAssistant,
+    entry_factory,
+) -> None:
+    """Malformed, non-finite, and pathologically nested samples stay on sample form."""
+    parent = entry_factory()
+    hass.config_entries.async_remove_subentry(parent, "test-source-subentry")
+
+    for index, sample in enumerate(
+        ("{not-json}", '{"value":1e400}', "[" * 2000 + "0" + "]" * 2000)
+    ):
+        with patch(
+            "custom_components.http_data_bridge.config_flow.webhook.async_generate_id",
+            return_value=f"invalid-webhook-{index}",
+        ):
+            result = await _start_source_flow(hass, parent)
+            result = await hass.config_entries.subentries.async_configure(
+                result["flow_id"],
+                user_input={
+                    CONF_SOURCE_NAME: "Invalid",
+                    CONF_SAMPLE_METHOD: SAMPLE_METHOD_PASTE,
+                    CONF_STALE_AFTER: 0,
+                    CONF_LOCAL_ONLY: False,
+                    CONF_ENABLED: True,
+                },
+            )
+            assert result["step_id"] == "sample"
+            result = await hass.config_entries.subentries.async_configure(
+                result["flow_id"], user_input={CONF_SAMPLE_PAYLOAD: sample}
+            )
+            assert result["step_id"] == "sample"
+            assert result["errors"][CONF_SAMPLE_PAYLOAD] == "invalid_json"
+            hass.config_entries.subentries.async_abort(result["flow_id"])
 
 
 async def test_reconfigure_remote_source_to_local_removes_cloudhook_marker(
@@ -349,7 +535,7 @@ async def test_reconfigure_remote_source_to_local_removes_cloudhook_marker(
             result["flow_id"],
             user_input={
                 CONF_SOURCE_NAME: "Test source",
-                CONF_SAMPLE_PAYLOAD: "",
+                CONF_SAMPLE_METHOD: SAMPLE_METHOD_KEEP,
                 CONF_STALE_AFTER: 0,
                 CONF_LOCAL_ONLY: True,
                 CONF_ENABLED: True,

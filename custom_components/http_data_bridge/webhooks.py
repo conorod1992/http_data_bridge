@@ -16,6 +16,15 @@ from .const import CONF_CLOUDHOOK_URL, CONF_LOCAL_ONLY, CONF_WEBHOOK_ID, MAX_PAY
 from .helpers import JsonValue, parse_json
 
 
+class PayloadValidationError(Exception):
+    """A webhook request did not contain an acceptable JSON payload."""
+
+    def __init__(self, error: str, status: HTTPStatus) -> None:
+        super().__init__(error)
+        self.error = error
+        self.status = status
+
+
 def _get_cloud_component() -> Any:
     """Return Home Assistant Cloud without importing it during integration import.
 
@@ -96,30 +105,38 @@ async def async_delete_cloudhook(hass: HomeAssistant, webhook_id: str) -> bool:
     return True
 
 
-async def async_handle_payload_request(runtime: Any, request: Request) -> Response:
-    """Validate one webhook request and pass its JSON payload to a source runtime."""
+async def async_read_json_payload(request: Request) -> JsonValue:
+    """Read and strictly validate a bounded JSON webhook body."""
     if request.content_length is not None and request.content_length > MAX_PAYLOAD_BYTES:
-        return json_response(
-            {"ok": False, "error": "payload_too_large"},
-            status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+        raise PayloadValidationError(
+            "payload_too_large", HTTPStatus.REQUEST_ENTITY_TOO_LARGE
         )
 
     raw = bytearray()
     async for chunk in request.content.iter_chunked(64 * 1024):
         raw.extend(chunk)
         if len(raw) > MAX_PAYLOAD_BYTES:
-            return json_response(
-                {"ok": False, "error": "payload_too_large"},
-                status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            raise PayloadValidationError(
+                "payload_too_large", HTTPStatus.REQUEST_ENTITY_TOO_LARGE
             )
 
     try:
-        payload: JsonValue = parse_json(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
-        return json_response(
-            {"ok": False, "error": "invalid_json"},
-            status=HTTPStatus.BAD_REQUEST,
-        )
+        return parse_json(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as err:
+        raise PayloadValidationError("invalid_json", HTTPStatus.BAD_REQUEST) from err
+
+
+def payload_error_response(err: PayloadValidationError) -> Response:
+    """Convert a payload validation failure into the public webhook response."""
+    return json_response({"ok": False, "error": err.error}, status=err.status)
+
+
+async def async_handle_payload_request(runtime: Any, request: Request) -> Response:
+    """Validate one webhook request and pass its JSON payload to a source runtime."""
+    try:
+        payload = await async_read_json_payload(request)
+    except PayloadValidationError as err:
+        return payload_error_response(err)
 
     await runtime.async_accept_payload(payload)
     return json_response({"ok": True})

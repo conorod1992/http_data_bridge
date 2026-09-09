@@ -29,6 +29,7 @@ from .const import (
     SUBENTRY_TYPE_SOURCE,
 )
 from .data import HttpDataBridgeManager, async_remove_storage
+from .frontend import async_register_frontend, async_remove_frontend_panel
 from .webhooks import async_delete_cloudhook
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -67,9 +68,6 @@ def _move_registry_ownership(
             legacy_entry.disabled_by is not None
             and disabled_by is er.RegistryEntryDisabler.CONFIG_ENTRY
         ):
-            # The source-level enabled flag preserves the old entry's disabled
-            # state. Keep explicitly disabled registry entities disabled as well
-            # after ownership moves to an enabled parent entry.
             disabled_by = er.RegistryEntryDisabler.USER
         entity_registry.async_update_entity(
             entity.entity_id,
@@ -94,8 +92,11 @@ def _move_registry_ownership(
 
 
 async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
-    """Set up HTTP Data Bridge and consolidate legacy v0.1 source entries."""
+    """Set up HTTP Data Bridge, frontend, and legacy-entry consolidation."""
+    await async_register_frontend(hass)
     await async_migrate_integration(hass)
+    # Migration can create the first v2 parent after frontend registration.
+    await async_register_frontend(hass)
     return True
 
 
@@ -109,8 +110,6 @@ async def async_migrate_integration(hass: HomeAssistant) -> None:
     if not legacy_entries:
         return
 
-    # Prefer an enabled entry as the parent. If all legacy entries are disabled,
-    # the parent remains disabled and each migrated source also records enabled=False.
     existing_parents = [
         entry
         for entry in hass.config_entries.async_entries(DOMAIN)
@@ -140,8 +139,6 @@ async def async_migrate_integration(hass: HomeAssistant) -> None:
         existing_source_ids.add(source_id)
         _move_registry_ownership(hass, legacy, parent, subentry)
 
-    # The surviving entry becomes the empty parent. Stable source_id values keep
-    # webhook IDs, entity unique IDs/device identifiers, and Store keys unchanged.
     hass.config_entries.async_update_entry(
         parent,
         title=PARENT_TITLE,
@@ -194,6 +191,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    # The component may have been loaded only to present the initial config flow,
+    # before a parent entry existed. Register the panel now that setup succeeded.
+    await async_register_frontend(hass)
     return True
 
 
@@ -214,18 +214,18 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Remove persisted source data and cloudhooks when the parent is deleted."""
+    """Remove persisted source data, cloudhooks, and panel on parent deletion."""
     protected = _migration_removals(hass)
     if entry.entry_id in protected:
         protected.discard(entry.entry_id)
         return
 
-    # A legacy v1 entry can still be removed before migration runs.
     if entry.version == 1:
         await async_remove_storage(hass, entry.entry_id)
         webhook_id = entry.data.get(CONF_WEBHOOK_ID)
         if webhook_id and entry.data.get(CONF_CLOUDHOOK_URL):
             await async_delete_cloudhook(hass, str(webhook_id))
+        async_remove_frontend_panel(hass)
         return
 
     for subentry in entry.subentries.values():
@@ -240,3 +240,5 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
             or not bool(subentry.data.get(CONF_LOCAL_ONLY, False))
         ):
             await async_delete_cloudhook(hass, str(webhook_id))
+
+    async_remove_frontend_panel(hass)
