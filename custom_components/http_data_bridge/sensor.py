@@ -12,9 +12,11 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import (
+    ATTR_VALUE,
     CONF_FIELDS,
     DOMAIN,
     FIELD_PLATFORM,
+    FIELD_STORE_IN_ATTRIBUTE,
     FIELD_UNIT,
     PLATFORM_SENSOR,
 )
@@ -48,7 +50,9 @@ async def async_setup_entry(
 
 
 class HttpDataBridgeSensor(HttpDataBridgeEntity, SensorEntity):
-    """Represent one selected JSON scalar as a sensor."""
+    """Represent one selected JSON value as a sensor."""
+
+    _unrecorded_attributes = frozenset({ATTR_VALUE})
 
     def __init__(
         self,
@@ -57,9 +61,13 @@ class HttpDataBridgeSensor(HttpDataBridgeEntity, SensorEntity):
     ) -> None:
         """Initialize sensor."""
         super().__init__(runtime, field)
+        self._store_in_attribute = bool(field.get(FIELD_STORE_IN_ATTRIBUTE, False))
         unit = field.get(FIELD_UNIT)
         self._requires_number = bool(unit)
-        if unit:
+
+        if self._store_in_attribute:
+            self._attr_device_class = SensorDeviceClass.TIMESTAMP
+        elif unit:
             self._attr_native_unit_of_measurement = str(unit)
 
     @property
@@ -67,9 +75,16 @@ class HttpDataBridgeSensor(HttpDataBridgeEntity, SensorEntity):
         """Return whether a fresh HA-compatible value is present."""
         if not super().available:
             return False
+
+        if self._store_in_attribute:
+            return True
+
         try:
             raw_value = self._value()
         except KeyError:
+            return False
+
+        if isinstance(raw_value, (dict, list)):
             return False
 
         if self._requires_number and not (
@@ -83,10 +98,22 @@ class HttpDataBridgeSensor(HttpDataBridgeEntity, SensorEntity):
         return True
 
     @property
-    def native_value(self) -> str | int | float | None:
-        """Return latest value."""
+    def native_value(self):
+        """Return the latest scalar value or receive time for attribute storage."""
+        if self._store_in_attribute:
+            return self._runtime.last_received
         try:
             return normalise_sensor_value(self._value())
+        except KeyError:
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose the configured JSON value without recording it in Recorder."""
+        if not self._store_in_attribute:
+            return None
+        try:
+            return {ATTR_VALUE: self._value()}
         except KeyError:
             return None
 
