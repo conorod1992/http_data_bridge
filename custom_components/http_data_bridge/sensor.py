@@ -98,6 +98,7 @@ class HttpDataBridgeLastReceivedSensor(SensorEntity):
     _attr_name = "Last received"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_should_poll = False
 
     def __init__(self, runtime: HttpDataBridgeRuntime) -> None:
         """Initialize diagnostic sensor."""
