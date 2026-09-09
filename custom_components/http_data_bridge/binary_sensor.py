@@ -12,6 +12,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from .const import CONF_FIELDS, FIELD_PLATFORM, PLATFORM_BINARY_SENSOR
 from .data import HttpDataBridgeManager, HttpDataBridgeRuntime
 from .entity import HttpDataBridgeEntity
+from .helpers import mapping_value_is_available
 
 
 async def async_setup_entry(
@@ -51,7 +52,7 @@ class HttpDataBridgeBinarySensor(HttpDataBridgeEntity, BinarySensorEntity):
         if not super().available:
             return False
         try:
-            return isinstance(self._value(), bool)
+            return mapping_value_is_available(self._field, self._value())
         except KeyError:
             return False
 
