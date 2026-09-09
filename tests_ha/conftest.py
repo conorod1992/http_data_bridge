@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 
 import pytest
 
@@ -36,9 +36,16 @@ def auto_enable_custom_integrations(enable_custom_integrations) -> None:
 
 
 @pytest.fixture(autouse=True)
-async def cleanup_loaded_entries(hass: HomeAssistant):
+async def cleanup_loaded_entries(
+    hass: HomeAssistant,
+) -> AsyncGenerator[None]:
     """Unload HTTP Data Bridge entries so tests also exercise clean teardown."""
     yield
+
+    # Reconfiguration schedules an entry reload asynchronously. Let that reload
+    # settle before inspecting entry state, otherwise teardown can race the new
+    # entity platforms and leave their polling timer behind.
+    await hass.async_block_till_done()
 
     for entry in hass.config_entries.async_entries(DOMAIN):
         if entry.state is config_entries.ConfigEntryState.LOADED:
