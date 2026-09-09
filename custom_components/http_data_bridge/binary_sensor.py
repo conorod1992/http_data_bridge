@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import CONF_FIELDS, FIELD_PLATFORM, PLATFORM_BINARY_SENSOR
-from .data import HttpDataBridgeRuntime
+from .data import HttpDataBridgeManager, HttpDataBridgeRuntime
 from .entity import HttpDataBridgeEntity
 
 
@@ -19,16 +19,19 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up HTTP Data Bridge binary sensors."""
-    runtime: HttpDataBridgeRuntime = entry.runtime_data
-    fields = [
-        field
-        for field in entry.data.get(CONF_FIELDS, [])
-        if field.get(FIELD_PLATFORM) == PLATFORM_BINARY_SENSOR
-    ]
-    async_add_entities(
-        HttpDataBridgeBinarySensor(entry, runtime, field) for field in fields
-    )
+    """Set up binary sensors for every configured push-source subentry."""
+    manager: HttpDataBridgeManager = entry.runtime_data
+
+    for runtime in manager.sources.values():
+        fields = [
+            field
+            for field in runtime.subentry.data.get(CONF_FIELDS, [])
+            if field.get(FIELD_PLATFORM) == PLATFORM_BINARY_SENSOR
+        ]
+        async_add_entities(
+            [HttpDataBridgeBinarySensor(runtime, field) for field in fields],
+            config_subentry_id=runtime.subentry.subentry_id,
+        )
 
 
 class HttpDataBridgeBinarySensor(HttpDataBridgeEntity, BinarySensorEntity):
@@ -36,12 +39,11 @@ class HttpDataBridgeBinarySensor(HttpDataBridgeEntity, BinarySensorEntity):
 
     def __init__(
         self,
-        entry: ConfigEntry,
         runtime: HttpDataBridgeRuntime,
         field: dict[str, Any],
     ) -> None:
         """Initialize binary sensor."""
-        super().__init__(entry, runtime, field)
+        super().__init__(runtime, field)
 
     @property
     def available(self) -> bool:

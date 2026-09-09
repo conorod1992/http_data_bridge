@@ -4,27 +4,42 @@ Turn incoming JSON webhook data into native Home Assistant entities through a gu
 
 HTTP Data Bridge is a custom Home Assistant integration for applications, scripts, websites, and devices that can **push JSON over HTTP** but do not have their own Home Assistant integration or MQTT support.
 
-Instead of building webhook automations, helpers, and templates by hand, you paste an example payload, select the values you care about, and HTTP Data Bridge creates normal Home Assistant sensors for them.
+Instead of building webhook automations, helpers, and templates by hand, you add a push source, paste an example payload, select the values you care about, and HTTP Data Bridge creates normal Home Assistant entities for them.
 
-## What v0.1.0 does
+## What it does
 
-- Creates a unique Home Assistant webhook for each push source.
-- Uses a guided config flow; no YAML is required.
+- Uses **one HTTP Data Bridge integration entry with multiple push sources** underneath it.
+- Creates a unique Home Assistant webhook for each source.
+- Uses a guided setup flow; no YAML is required.
 - Accepts nested JSON objects and arrays.
 - Shows every scalar leaf value in the sample payload and lets you select which ones to expose.
 - Creates normal `sensor` entities for strings/numbers/null values.
 - Can create `binary_sensor` entities from JSON `true` / `false` values.
 - Lets you assign an optional unit of measurement to numeric sensors.
-- Generates ready-to-copy sender examples for:
-  - cURL
-  - JavaScript
-  - PHP
+- Generates ready-to-copy sender examples for cURL, JavaScript, and PHP.
 - Stores only the **selected values**, not the complete incoming payload.
 - Restores the last selected values after Home Assistant restarts.
 - Can mark entities unavailable after a configurable period without a new payload.
-- Can optionally restrict a source to requests from the local network.
-- Adds a diagnostic **Last received** timestamp sensor.
-- Keeps the same webhook ID when a source is reconfigured.
+- Can restrict a source to requests from the local network.
+- When local-only is disabled and Home Assistant Cloud is available, automatically creates and shows a **Nabu Casa cloudhook URL**.
+- Adds a diagnostic **Last received** timestamp sensor per source.
+- Keeps the same source identity, webhook ID, entities, and persisted values when a source is reconfigured.
+
+## Multiple sources
+
+HTTP Data Bridge is configured once in Home Assistant. Individual producers are then added as **sources**:
+
+```text
+HTTP Data Bridge
+├── Driving website
+├── Home Intelligence
+├── Backup monitor
+└── Other application
+```
+
+Each source has its own webhook, entity mappings, stale timeout, local-only setting, and persisted values.
+
+To add another source, open **Settings → Devices & services → HTTP Data Bridge** and choose **Add source**.
 
 ## Example
 
@@ -41,7 +56,7 @@ Suppose an external application can send:
 }
 ```
 
-During setup, HTTP Data Bridge shows:
+During source setup, HTTP Data Bridge shows:
 
 ```text
 backup.status      — running
@@ -57,7 +72,7 @@ You might choose:
 - `disk_free_gb` → **Disk free** (`sensor`, `GB`)
 - `online` → **Online** (`binary_sensor`)
 
-Every later POST to the generated webhook updates those entities immediately.
+Every later POST to that source's generated webhook updates those entities immediately.
 
 ## Installation
 
@@ -70,36 +85,36 @@ Every later POST to the generated webhook updates those entities immediately.
 
 ### Manual
 
-Copy:
-
-```text
-custom_components/http_data_bridge
-```
-
-into:
-
-```text
-/config/custom_components/http_data_bridge
-```
-
-and restart Home Assistant.
+Copy `custom_components/http_data_bridge` into `/config/custom_components/http_data_bridge` and restart Home Assistant.
 
 ## Setup
 
 1. Go to **Settings → Devices & services**.
 2. Select **Add integration**.
 3. Search for **HTTP Data Bridge**.
-4. Give the source a friendly name.
-5. Paste an example of the JSON your external system will send.
-6. Optionally configure:
+4. The integration creates its parent entry and opens the first **Add source** flow.
+5. Give the source a friendly name.
+6. Paste an example of the JSON your external system will send.
+7. Optionally configure:
    - **Mark unavailable after** — seconds without a valid payload before its selected entities become unavailable. Use `0` to disable expiry.
-   - **Only allow local network requests** — useful when the sender is on your LAN.
-7. Select the JSON values you want to expose.
-8. Configure each selected value.
-9. Copy the generated webhook URL and one of the sender examples.
-10. Save the integration and begin POSTing JSON.
+   - **Only allow local network requests** — enable when the sender is entirely on your LAN.
+   - **Enable source** — disable a source without deleting its mappings or webhook identity.
+8. Select the JSON values you want to expose.
+9. Configure each selected value.
+10. Copy the generated webhook URL and one of the sender examples.
+11. Save the source and begin POSTing JSON.
 
-The example payload is only used while the config flow is open. It is **not** saved in the config entry.
+The example payload is only used while the setup flow is open. It is **not** saved in the source configuration.
+
+## Local and remote webhook URLs
+
+The **Only allow local network requests** switch is the user-facing control for webhook reachability.
+
+- When enabled, HTTP Data Bridge uses a normal Home Assistant webhook URL intended for local access and Home Assistant rejects remote/cloud requests to that webhook.
+- When disabled, HTTP Data Bridge automatically uses a Nabu Casa cloudhook when Home Assistant Cloud is active and connected.
+- If Home Assistant Cloud is unavailable, it falls back to Home Assistant's normal webhook URL using the configured external URL where possible.
+
+There is no separate “cloudhook mode” to configure. If a cloudhook is used, its URL is persisted and reused across reloads instead of being casually regenerated.
 
 ## Sending data
 
@@ -111,7 +126,7 @@ Example:
 curl -X POST \
   -H 'Content-Type: application/json' \
   --data '{"temperature":21.4,"online":true}' \
-  'https://home-assistant.example/api/webhook/YOUR_SECRET_WEBHOOK_ID'
+  'https://hooks.nabu.casa/YOUR_SECRET_CLOUDHOOK'
 ```
 
 A valid request returns:
@@ -126,74 +141,40 @@ Malformed JSON returns HTTP `400`. Payloads larger than 256 KiB return HTTP `413
 
 Each accepted POST is treated as the latest snapshot from that source.
 
-If a configured field is missing from the newest payload, that entity becomes unavailable until a later payload contains the field again.
-
-For example, if you configured both `temperature` and `humidity`:
-
-```json
-{
-  "temperature": 21.4
-}
-```
-
-updates `temperature` and makes `humidity` unavailable.
-
-This avoids silently leaving an old value visible when the sender has stopped supplying it.
+If a configured field is missing from the newest payload, that entity becomes unavailable until a later payload contains the field again. This avoids silently leaving an old value visible when the sender has stopped supplying it.
 
 ## Nested data and arrays
 
-Nested objects work automatically:
-
-```json
-{
-  "weather": {
-    "temperature": 12.7
-  }
-}
-```
-
-can expose `weather.temperature`.
-
-Arrays are indexed:
-
-```json
-{
-  "rooms": [
-    {
-      "name": "Kitchen",
-      "temperature": 21.1
-    }
-  ]
-}
-```
-
-can expose `rooms[0].temperature`.
+Nested objects work automatically. Arrays are indexed, for example `rooms[0].temperature`.
 
 Array indexes are positional. If the order of an array changes between payloads, an index such as `[0]` may refer to a different item. For data with changing order, it is better for the sender to use stable object keys.
 
 ## Reconfiguring
 
-Open the integration entry and choose **Reconfigure**.
+Open the HTTP Data Bridge integration entry and reconfigure the desired source.
 
-You can change the name, stale timeout, or local-only setting without replacing the entity mappings.
+You can change the source name, stale timeout, local-only setting, or enabled state without replacing its entity mappings. To replace the mapped fields, paste a new sample JSON payload during reconfiguration and select the desired fields again.
 
-To replace the mapped fields, paste a new sample JSON payload during reconfiguration and select the desired fields again.
+The source ID and webhook ID are deliberately preserved.
 
-The webhook ID is deliberately preserved, so existing sender code does not need to change.
+## Upgrading from v0.1.x
+
+v0.1.x stored each push source as a separate Home Assistant config entry. v0.2 automatically consolidates those entries beneath one **HTTP Data Bridge** parent entry.
+
+The migration deliberately preserves each source's previous config-entry ID as its stable source ID. This allows existing webhook IDs, entity unique IDs, device identifiers, entity history, and persisted last values to remain associated with the same logical source.
+
+A previously disabled v0.1 source remains disabled after migration.
 
 ## Security
 
-A Home Assistant webhook URL contains a long random ID and acts as a bearer secret.
+A Home Assistant webhook/cloudhook URL contains a long random secret.
 
-- Do not publish or log the webhook URL unnecessarily.
+- Do not publish or log the complete URL unnecessarily.
 - Anyone who has the complete URL can submit data to that source.
 - Enable **Only allow local network requests** if the sender is entirely local.
-- If an internet-hosted sender needs to reach Home Assistant, your Home Assistant instance must already be reachable at the generated URL. HTTP Data Bridge does not create a new public tunnel or cloudhook.
 - Only values explicitly selected during setup are persisted. Unselected fields in incoming payloads are not written to HTTP Data Bridge storage.
 
 ## Data types
-
-v0.1.0 intentionally keeps the mapping rules simple:
 
 | JSON value | Entity support |
 | --- | --- |
@@ -226,22 +207,17 @@ without adding MQTT infrastructure.
 
 ## Current limitations
 
-v0.1.0 is push-only.
-
-It does not currently:
+The integration is currently push-only. It does not yet:
 
 - poll REST APIs;
+- capture a setup sample automatically from a live incoming request;
+- provide the planned dedicated management frontend;
+- expose structured payloads as a timestamp/payload entity;
 - receive form-encoded payloads;
 - transform values with regex/templates;
 - map arbitrary strings such as `"ON"` / `"OFF"` into binary sensors;
 - create entities dynamically from previously unseen fields;
 - provide authentication in addition to the secret webhook URL.
-
-REST/pull support can be added later without changing the core entity-mapping model.
-
-## Development
-
-The integration follows the current Home Assistant config-entry/webhook architecture and includes HACS and hassfest validation.
 
 ## License
 

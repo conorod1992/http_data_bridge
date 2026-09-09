@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity
 
@@ -19,21 +18,19 @@ class HttpDataBridgeEntity(Entity):
 
     def __init__(
         self,
-        entry: ConfigEntry,
         runtime: HttpDataBridgeRuntime,
         field: dict[str, Any],
     ) -> None:
         """Initialize the entity."""
-        self._entry = entry
         self._runtime = runtime
         self._field = field
         self._path = str(field[FIELD_PATH])
 
         self._attr_name = str(field[FIELD_NAME])
-        self._attr_unique_id = f"{entry.entry_id}:{self._path}"
+        self._attr_unique_id = f"{runtime.source_id}:{self._path}"
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name=entry.title,
+            identifiers={(DOMAIN, runtime.source_id)},
+            name=runtime.subentry.title,
             manufacturer="HTTP Data Bridge",
             model="Push source",
         )

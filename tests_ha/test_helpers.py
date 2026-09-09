@@ -16,9 +16,7 @@ def test_nested_fields_and_json_pointer_escaping() -> None:
         "rooms": [{"name": "Kitchen", "temperature": 21.4}],
         "a/b": {"~flag": True},
     }
-
     fields = dict(iter_scalar_fields(payload))
-
     assert fields["/rooms/0/name"] == "Kitchen"
     assert fields["/rooms/0/temperature"] == 21.4
     assert fields["/a~1b/~0flag"] is True
@@ -37,14 +35,7 @@ def test_root_scalar_uses_empty_pointer() -> None:
 def test_missing_path_raises_key_error() -> None:
     """Missing object members and array indexes should fail consistently."""
     payload = {"items": [1]}
-
-    for pointer in (
-        "/missing",
-        "/items/2",
-        "/items/not-an-index",
-        "/items/-1",
-        "/items/01",
-    ):
+    for pointer in ("/missing", "/items/2", "/items/not-an-index", "/items/-1", "/items/01"):
         try:
             get_by_pointer(payload, pointer)
         except KeyError:
@@ -58,7 +49,6 @@ def test_object_key_does_not_redirect_after_shape_change() -> None:
     original = {"value": {"-1": "selected", "01": "also selected"}}
     assert get_by_pointer(original, "/value/-1") == "selected"
     assert get_by_pointer(original, "/value/01") == "also selected"
-
     changed = {"value": ["zero", "one"]}
     for pointer in ("/value/-1", "/value/01"):
         try:
