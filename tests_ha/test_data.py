@@ -2,25 +2,92 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from unittest.mock import AsyncMock, patch
 
+from aiohttp.web import Request, Response
+import pytest
+
+from homeassistant.components import webhook
+from homeassistant.config_entries import ConfigSubentry
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from custom_components.http_data_bridge.const import (
+    CONF_SOURCE_ID,
+    CONF_SOURCE_NAME,
+    CONF_WEBHOOK_ID,
+    DOMAIN,
     FIELD_NAME,
     FIELD_PATH,
     FIELD_PLATFORM,
     FIELD_STORE_IN_ATTRIBUTE,
     PLATFORM_SENSOR,
+    SUBENTRY_TYPE_SOURCE,
 )
-from custom_components.http_data_bridge.data import HttpDataBridgeRuntime
+from custom_components.http_data_bridge.data import (
+    HttpDataBridgeManager,
+    HttpDataBridgeRuntime,
+)
 
 
 async def _runtime_from_entry(hass: HomeAssistant, entry_factory) -> HttpDataBridgeRuntime:
     entry = entry_factory()
     subentry = entry.subentries["test-source-subentry"]
     return HttpDataBridgeRuntime(hass, entry, subentry)
+
+
+async def test_manager_setup_rolls_back_earlier_sources_if_later_source_fails(
+    hass: HomeAssistant,
+    entry_factory,
+) -> None:
+    """A partial parent setup must not leave already registered webhooks behind."""
+    entry = entry_factory(local_only=True)
+    first = entry.subentries["test-source-subentry"]
+    second_data = dict(first.data)
+    second_data.update(
+        {
+            CONF_SOURCE_ID: "second-source-id",
+            CONF_SOURCE_NAME: "Second source",
+            CONF_WEBHOOK_ID: "second-webhook-id",
+        }
+    )
+    second = ConfigSubentry(
+        data=MappingProxyType(second_data),
+        subentry_type=SUBENTRY_TYPE_SOURCE,
+        title="Second source",
+        unique_id=None,
+    )
+    hass.config_entries.async_add_subentry(entry, second)
+
+    manager = HttpDataBridgeManager(hass, entry)
+    with patch(
+        "custom_components.http_data_bridge.data.async_resolve_webhook_url",
+        new_callable=AsyncMock,
+        side_effect=[
+            ("/api/webhook/test-http-data-bridge-webhook", None, False),
+            RuntimeError("second source setup failed"),
+        ],
+    ):
+        with pytest.raises(RuntimeError, match="second source setup failed"):
+            await manager.async_setup()
+
+    async def _probe_handler(
+        _hass: HomeAssistant, _webhook_id: str, _request: Request
+    ) -> Response:
+        return Response()
+
+    # Registration succeeds only if rollback unregistered the first source.
+    webhook.async_register(
+        hass,
+        DOMAIN,
+        "rollback probe",
+        "test-http-data-bridge-webhook",
+        _probe_handler,
+        local_only=True,
+        allowed_methods={"POST"},
+    )
+    webhook.async_unregister(hass, "test-http-data-bridge-webhook")
 
 
 async def test_shutdown_flushes_current_selected_view(
