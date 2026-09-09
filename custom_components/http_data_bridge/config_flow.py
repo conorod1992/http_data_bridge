@@ -721,10 +721,13 @@ class HttpDataBridgeSourceFlow(ConfigSubentryFlow):
             old_subentry = self._get_reconfigure_subentry()
             self._cleanup_removed_entities(old_subentry, self._field_configs)
 
-            if self._local_only and old_subentry.data.get(CONF_CLOUDHOOK_URL):
-                # The saved source becomes local-only immediately even when cloud
-                # cleanup cannot be completed right now. Runtime unload also retries.
-                await async_delete_cloudhook(self.hass, self._webhook_id)
+            if self._local_only and (
+                old_cloudhook := old_subentry.data.get(CONF_CLOUDHOOK_URL)
+            ):
+                # Keep the old cloudhook URL only as a durable cleanup marker.
+                # The new source is local-only immediately; manager setup ignores
+                # this URL for routing and retries deletion until Cloud is reachable.
+                data[CONF_CLOUDHOOK_URL] = str(old_cloudhook)
 
             self._committed = True
             return self.async_update_and_abort(
